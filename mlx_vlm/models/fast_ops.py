@@ -5,12 +5,82 @@ from typing import Optional
 
 import mlx.core as mx
 
+from .linear import DECODE_BLOCK_SIZE
+
 _COMMON_HEADER = r"""
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 using namespace metal;
 """
+
+
+@lru_cache(maxsize=None)
+def _short_conv_block_kernel():
+    return mx.fast.metal_kernel(
+        name="short_conv_block",
+        input_names=["x", "state", "w"],
+        output_names=["y", "new_state"],
+        source=r"""
+            uint c = thread_position_in_grid.x;
+            uint b = thread_position_in_grid.y;
+            if (c >= C) return;
+            const device T* s = state + b * (KS - 1) * C;
+            const device T* block = x + b * L * C;
+            for (int t = 0; t < L; ++t) {
+                float v = 0.0f;
+                for (int j = 0; j < KS - 1; ++j) {
+                    int position = t + j;
+                    T value = position < KS - 1
+                        ? s[position * C + c]
+                        : block[(position - (KS - 1)) * C + c];
+                    v += float(w[c * KS + j]) * float(value);
+                }
+                v += float(w[c * KS + KS - 1]) * float(block[t * C + c]);
+                y[(b * L + t) * C + c] = T(v / (1.0f + metal::exp(-v)));
+            }
+            for (int j = 0; j < KS - 1; ++j) {
+                int position = L + j;
+                new_state[(b * (KS - 1) + j) * C + c] = position < KS - 1
+                    ? s[position * C + c]
+                    : block[(position - (KS - 1)) * C + c];
+            }
+        """,
+    )
+
+
+def short_conv_block(x, state, weight):
+    """Match consecutive unmasked ShortConv1d decode steps in one dispatch."""
+    if (
+        not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+        or state is None
+        or x.ndim != 3
+        or not 1 < x.shape[1] <= DECODE_BLOCK_SIZE
+        or weight.ndim != 3
+        or weight.shape[0] != x.shape[-1]
+        or weight.shape[-1] != 1
+        or weight.shape[1] < 2
+        or state.shape != (x.shape[0], weight.shape[1] - 1, x.shape[-1])
+        or x.dtype not in (mx.float32, mx.float16, mx.bfloat16)
+        or x.dtype != state.dtype
+        or x.dtype != weight.dtype
+    ):
+        return None
+    batch, length, channels = x.shape
+    return _short_conv_block_kernel()(
+        inputs=[x, state, weight],
+        template=[
+            ("T", x.dtype),
+            ("C", channels),
+            ("KS", weight.shape[1]),
+            ("L", length),
+        ],
+        grid=(channels, batch, 1),
+        threadgroup=(min(1024, channels), 1, 1),
+        output_shapes=[x.shape, state.shape],
+        output_dtypes=[x.dtype, x.dtype],
+    )
 
 
 _HC_NORM_SOURCE = r"""
@@ -414,9 +484,10 @@ inline float load_affine5_vector_exact(
     const device T* x,
     thread float* x_thread) {
   float sum = 0.0f;
+  // Match MLX's qmv: promote before adding, not after a low-precision sum.
   for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-        x[i + 6] + x[i + 7];
+    sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+        float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
     x_thread[i] = x[i];
     x_thread[i + 1] = x[i + 1] / 32.0f;
     x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -476,8 +547,9 @@ inline float load_affine4_vector_exact(
     const device T* x,
     thread float* x_thread) {
   float sum = 0.0f;
+  // Match MLX's qmv: promote before adding, not after a low-precision sum.
   for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+    sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
     x_thread[i] = x[i];
     x_thread[i + 1] = x[i + 1] / 16.0f;
     x_thread[i + 2] = x[i + 2] / 256.0f;

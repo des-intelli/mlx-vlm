@@ -16,7 +16,7 @@ from ..cache import CacheList, PoolingCache, RotatingKVCache
 from ..linear import DECODE_BLOCK_SIZE, linear, tokenwise
 from ..mla import MultiLinear
 from ..pipeline import PipelineMixin
-from ..switch_layers import MoE, SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, MoE, SwitchGLU
 from .config import ModelConfig
 from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead
@@ -26,7 +26,14 @@ def make_quantization_config(model):
     mxfp4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
     mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 
-    flat_modules = tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+    language_model = getattr(model, "language_model", model)
+    prefix = "language_model." if language_model is not model else ""
+    flat_modules = [
+        (prefix + name, module)
+        for name, module in tree_flatten(
+            language_model.leaf_modules(), is_leaf=nn.Module.is_module
+        )
+    ]
     experts = {
         k: mxfp4
         for k, _ in flat_modules
@@ -159,6 +166,7 @@ def _expert_select(
     inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k].astype(
         mx.int32
     )
+    inds = mx.stop_gradient(inds)
     weights = mx.take_along_axis(scores, inds, axis=-1)
     if scoring_func != "softmax" and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -705,6 +713,7 @@ class Indexer(nn.Module):
         )
         fscore = (fs * self.scale * wq).sum(axis=1)  # (B,1,Kb*b)
         sel = mx.argpartition(-fscore, kth=k - 1, axis=-1)[..., :k]  # (B,1,k)
+        sel = mx.stop_gradient(sel)
         return mx.take_along_axis(pos, sel, axis=-1)
 
     def __call__(
@@ -1385,7 +1394,7 @@ class LanguageModel(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                for suffix in ("weight", "scales"):
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
                     key0 = f"{prefix}.0.{src}.{suffix}"
                     if key0 in weights:
                         stacked = [

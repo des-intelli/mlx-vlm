@@ -14,7 +14,7 @@ Then check if the model has weights in the
 convert it.
 
 After that, add the model file to the
-[`mlx_vlm/models`](https://github.com/Blaizzy/mlx-vlm/tree/main/src/models)
+[`mlx_vlm/models`](https://github.com/Neywa-Labs/mlx-vlm/tree/main/mlx_vlm/models)
 directory. You can see other examples there. We recommend starting from a model
 that is similar to the model you are porting.
 
@@ -83,9 +83,10 @@ backend, checks that the specified weights are partitioned, and compares batch-1
 and batch-4 prefill and cached decode against an unsharded model and across ranks.
 Keep special model initialization in a setup helper in `test_models.py`.
 
-From the repository root, you can run the tests with:
+From the repository root, install the test dependencies and run the tests with:
 
 ```shell
+python -m pip install -e ".[test]"
 python -m pytest -q mlx_vlm/tests
 ```
 
@@ -94,7 +95,10 @@ python -m pytest -q mlx_vlm/tests
 1. Fork and submit pull requests to the repo.
 2. If you've added code that should be tested, add tests.
 3. Every PR should have passing tests and at least one review.
-4. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
+4. Sign your commits (GPG or SSH) so GitHub marks them **Verified** — see
+   [GitHub's commit-signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
+   PRs with unsigned commits get an automated reminder.
+5. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
    This should install hooks for running `black` and `clang-format` to ensure
    consistent style for C++ and python code.
 

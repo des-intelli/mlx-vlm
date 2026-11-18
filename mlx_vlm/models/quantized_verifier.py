@@ -5,6 +5,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import sum_gradients
 
 from .switch_layers import QuantizedSwitchLinear
 
@@ -14,6 +15,7 @@ FIXED_FORMATS = {
     "mxfp8": (8, 32),
     "nvfp4": (4, 16),
 }
+_QUANTIZED_LINEARS = (nn.QuantizedLinear, nn.QuantizedAllToShardedLinear)
 
 _QUANTIZED_MOE_HC_HEADER = r"""
 #include <metal_simdgroup>
@@ -40,10 +42,11 @@ inline float load_quantized_vector(
     const device T* x,
     thread float* x_thread) {
   float sum = 0.0f;
+  // Match MLX's qmv: promote before adding, not after a low-precision sum.
   if constexpr (BITS == 3 || BITS == 5) {
     for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
     }
   } else if constexpr (BITS == 8) {
     for (int i = 0; i < VALUES_PER_THREAD; ++i) {
@@ -51,7 +54,7 @@ inline float load_quantized_vector(
     }
   } else {
     for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
     }
   }
   for (int i = 0; i < VALUES_PER_THREAD; ++i) {
@@ -352,7 +355,7 @@ if (matrix_row < HC) {
 
 def supports_quantization(module) -> bool:
     """Return whether ``module`` uses one of MLX's native weight formats."""
-    if not isinstance(module, (nn.QuantizedLinear, QuantizedSwitchLinear)):
+    if not isinstance(module, (*_QUANTIZED_LINEARS, QuantizedSwitchLinear)):
         return False
     if module.mode == "affine":
         return module.bits in AFFINE_BITS and module.group_size in (32, 64, 128)
@@ -378,26 +381,31 @@ def exact_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     """General BxT quantized projection with decode-equivalent arithmetic."""
     if (
         not supports_quantization(linear)
-        or not isinstance(linear, nn.QuantizedLinear)
+        or not isinstance(linear, _QUANTIZED_LINEARS)
         or x.ndim != 3
         or x.shape[-1] != _input_dims(linear)
     ):
         return None
     if x.shape[1] <= 1:
         return linear(x)
-    return _exact_time_batch(linear, x)
+    from .quantized import native_affine_batch_linear
+
+    output = native_affine_batch_linear(linear, x)
+    return _exact_time_batch(linear, x) if output is None else output
 
 
 def singleton_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     """Fuse a runtime-sized batch while retaining singleton qmv arithmetic."""
     if (
         not supports_quantization(linear)
-        or not isinstance(linear, nn.QuantizedLinear)
+        or not isinstance(linear, _QUANTIZED_LINEARS)
         or x.ndim != 3
         or x.shape[-1] != _input_dims(linear)
     ):
         return None
 
+    if isinstance(linear, nn.QuantizedAllToShardedLinear):
+        x = sum_gradients(linear.group)(x)
     indices = mx.zeros((*x.shape[:2], 1), dtype=mx.int32)
     projected = mx.expand_dims(mx.contiguous(x), (-2, -3))
     output = (
@@ -780,9 +788,10 @@ def _target_verify_qlinear_header(
     template <typename T>
     inline float load_vector_exact(const device T* x, thread float* x_thread) {
       float sum = 0.0f;
+      // Match MLX's qmv: promote before adding, not after a low-precision sum.
       if (BITS == 4) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+          sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
           x_thread[i] = x[i];
           x_thread[i + 1] = x[i + 1];
           x_thread[i + 2] = x[i + 2];
@@ -790,8 +799,8 @@ def _target_verify_qlinear_header(
         }
       } else if (BITS == 5) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-              x[i + 6] + x[i + 7];
+          sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+              float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
           x_thread[i] = x[i];
           x_thread[i + 1] = x[i + 1] / 32.0f;
           x_thread[i + 2] = x[i + 2] / 4.0f;
