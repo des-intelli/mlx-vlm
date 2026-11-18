@@ -590,6 +590,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .fp8 import transform_fp8_weights
 
                 weights, quantization = transform_fp8_weights(weights, config)
+                # V4's native fallback is selected by checkpoint architecture,
+                # including loaders that wrap the language model class.
+                if quantization is None and config.get("model_type") == "deepseek_v4":
+                    from .models.deepseek_v4.language import make_quantization_config
+
+                    quantization = make_quantization_config(model)
                 # Mixed ModelOpt NVFP4/FP8 exports describe their actual packed
                 # modules during conversion; the native V4.1 map would also
                 # quantize dense attention/shared-expert tensors in that format.
