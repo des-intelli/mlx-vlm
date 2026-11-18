@@ -162,6 +162,45 @@ def test_arrays_cache_advance_matches_decremented_values():
     assert cache.left_padding is None and cache.lengths is None
 
 
+def test_deepseek_v41_append_unequal_chunks_preserves_populated_rows():
+    from mlx_vlm.models import deepseek_v41
+    from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+    from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+    mx.random.seed(19)
+    case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+    config = build_config(deepseek_v41, case["config"])
+    model = LanguageModel(config)
+    model.engram_hash = NgramHashState(
+        config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
+    )
+    model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
+    references = [model.make_cache(), model.make_cache()]
+    for cache, prompt in zip(references, [[3, 7, 11], [9, 13, 17, 21, 25]]):
+        mx.eval(model(mx.array([prompt]), cache=cache).logits)
+    batch = references[0][0].merge([row[0] for row in references])
+    for chunks in [[[19, 23, 27, 31], [29, 33, 37, 41, 45]], [[47], [51]]]:
+        lengths = [len(tokens) for tokens in chunks]
+        width = batch.prepare_append(lengths)
+        ids = mx.array([[0] * (width - len(tokens)) + tokens for tokens in chunks])
+        actual = model(ids, cache=[batch], logits_to_keep=1).logits
+        expected = mx.concatenate(
+            [
+                model(mx.array([tokens]), cache=cache, logits_to_keep=1).logits
+                for tokens, cache in zip(chunks, references)
+            ]
+        )
+        assert mx.allclose(actual, expected, atol=1e-4).item()
+        for i, reference in enumerate(references):
+            row = batch.extract(i)
+            assert row.offset == reference[0].offset
+            assert mx.array_equal(row.engram, reference[0].engram).item()
+    with pytest.raises(ValueError):
+        batch.prepare_append([0, 1])
+    with pytest.raises(ValueError):
+        batch.prepare_append([1])
+
+
 @pytest.mark.parametrize("right_pad", [False, True])
 @pytest.mark.parametrize("chunks", [((0, 9),), ((0, 2), (2, 5), (5, 8), (8, 9))])
 def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks):

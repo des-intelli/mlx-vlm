@@ -1362,6 +1362,21 @@ class BatchDeepseekV41Cache:
         if right_padding is not None:
             self._lengths = list(lengths)
 
+    def prepare_append(self, lengths):
+        """Append unequal token chunks to populated rows using left padding.
+
+        Attention, compression, and Engram visit each row's valid tokens only.
+        Dense projections and experts can share the padded model batch.
+        """
+        if len(lengths) != self._batch_size or any(length < 1 for length in lengths):
+            raise ValueError("Append lengths must be positive and match the batch")
+        if any(self.left_padding) or any(x is not None for x in self._lengths):
+            raise ValueError("Finish pending padding before appending new chunks")
+        self._unpack()
+        width = max(lengths)
+        self.left_padding = [width - length for length in lengths]
+        return width
+
     def finalize(self):
         self._lengths = [None] * self._batch_size
 
