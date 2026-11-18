@@ -4181,8 +4181,11 @@ def test_deepseek_v41_fused_weighted_activation_preserves_rounding(dtype, limit)
     from mlx_vlm.models.deepseek_v41.language import _swiglu
 
     mx.random.seed(37)
-    for rows in [1, 6, 66, 2048]:
-        up = (mx.random.normal((rows, 1, 256)) * 8).astype(dtype)
+    for rows, width in [(1, 256), (6, 256), (66, 256), (2048, 256), (6144, 2304)]:
+        # Full prefill dimensions expose sigmoid rounding at FP8 boundaries.
+        if width == 2304:
+            mx.random.seed(137)
+        up = (mx.random.normal((rows, 1, width)) * 8).astype(dtype)
         gate = (mx.random.normal(up.shape) * 8).astype(dtype)
         weights = mx.random.uniform(shape=(rows, 1, 1))
         weights[::3] = 0

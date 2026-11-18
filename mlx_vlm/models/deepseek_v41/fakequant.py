@@ -84,7 +84,11 @@ def _make_weighted_swiglu_fp8_kernel():
                 g = metal::min(g, limit[0]);
                 u = metal::clamp(u, -limit[0], limit[0]);
             }
-            float activated = (g / (1.0f + metal::exp(-g))) * u;
+            // Match MLX Sigmoid's stable expression and precise exponential;
+            // algebraically equivalent forms can cross FP8 rounding boundaries.
+            float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
+            float sigmoid = g < 0 ? y : 1.0f - y;
+            float activated = (g * sigmoid) * u;
             // Keep checkpoint-required BF16/FP16 rounding BEFORE FP8 scaling.
             float value = float(T(activated * weights[i / WIDTH]));
             float amax = metal::max(metal::simd_max(metal::abs(value)), 1e-4f);
