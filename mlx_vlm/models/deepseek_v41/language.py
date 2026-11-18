@@ -1484,6 +1484,7 @@ class LanguageModel(nn.Module):
         engram_hashes: Optional[mx.array] = None,
         inputs: Optional[mx.array] = None,
         n_to_process: Optional[int] = None,
+        logits_to_keep: Optional[int] = None,
         **kwargs,
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
@@ -1494,6 +1495,8 @@ class LanguageModel(nn.Module):
         and a chunked prompt encodes differently from an unchunked one.
         `n_to_process` is implied by the slice and is not needed.
         """
+        if logits_to_keep is not None and logits_to_keep < 0:
+            raise ValueError("logits_to_keep must be nonnegative or None")
         entry = cache[0] if cache else DeepseekV41Cache(len(self.layers))
         if input_ids is None:
             input_ids = inputs
@@ -1531,7 +1534,16 @@ class LanguageModel(nn.Module):
                     engram_mask,
                 )
             h, pre_mix = layer(h, pre_mix, image_mask, entry)
-        h = DeepseekV41Block.hc_pre(h, pre_mix)
-        logits = self.head(self.norm(h))
         entry.advance(seqlen)
+        if logits_to_keep == 0:
+            # A prefill-only step still executes the final layer's collectives
+            # and materializes all recurrent state before the next chunk.
+            mx.eval(h, entry.state)
+            logits = mx.zeros((batch, 0, self.config.vocab_size), mx.float32)
+        else:
+            if logits_to_keep is not None:
+                h = h[:, -logits_to_keep:]
+                pre_mix = pre_mix[:, -logits_to_keep:]
+            h = DeepseekV41Block.hc_pre(h, pre_mix)
+            logits = self.head(self.norm(h))
         return LanguageModelOutput(logits=logits)

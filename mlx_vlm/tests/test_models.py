@@ -1670,6 +1670,28 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
     def setUp(self):
         mx.random.seed(0)
 
+    def test_selected_logits_preserve_chunked_cache_and_decode(self):
+        config = tiny_config("deepseek_v41")
+        model = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        ids = mx.array([[3, 7, 11, 15, 19, 23, 27, 31]])
+        full_cache, selected_cache = model.make_cache(), model.make_cache()
+        reference = model(ids[:, :4], cache=full_cache).logits
+        mx.eval(reference)
+        empty = model(ids[:, :4], cache=selected_cache, logits_to_keep=0).logits
+        self.assertEqual(empty.shape, (1, 0, config.vocab_size))
+        expected = model(ids[:, 4:], cache=full_cache).logits[:, -1:]
+        actual = model(ids[:, 4:], cache=selected_cache, logits_to_keep=1).logits
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+        for left, right in zip(full_cache[0].state, selected_cache[0].state):
+            self.assertTrue(mx.array_equal(left, right).item())
+        next_id = mx.argmax(expected[:, -1], axis=-1)[:, None]
+        expected = model(next_id, cache=full_cache).logits
+        actual = model(next_id, cache=selected_cache, logits_to_keep=1).logits
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+        with self.assertRaises(ValueError):
+            model(ids, logits_to_keep=-1)
+
     def test_index_rotary_matches_reference_at_long_positions(self):
         from mlx_vlm.models.deepseek_v41.language import (
             _apply_index_rotary,
