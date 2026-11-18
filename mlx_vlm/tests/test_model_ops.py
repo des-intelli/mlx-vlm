@@ -672,7 +672,8 @@ def test_deepseek_v41_sparse_attention_split_decode_matches_original_reduction_e
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 @pytest.mark.parametrize("owned", ["none", "some", "all"])
-def test_deepseek_v41_device_routes_match_compact_owned_routes(dtype, owned):
+@pytest.mark.parametrize("batch", [4, 11, 16])
+def test_deepseek_v41_device_routes_match_compact_owned_routes(dtype, owned, batch):
     from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoE
 
     mx.random.seed(43)
@@ -681,17 +682,17 @@ def test_deepseek_v41_device_routes_match_compact_owned_routes(dtype, owned):
     model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
     model.sharding_group = SimpleNamespace(rank=lambda: 1)
     count = model.switch_mlp.gate_proj.weight.shape[0]
-    x = mx.random.normal((4, 1, config.hidden_size)).astype(dtype)
+    x = mx.random.normal((batch, 1, config.hidden_size)).astype(dtype)
     if owned == "none":
-        indices = mx.zeros((4, 1, 2), mx.int32)
+        indices = mx.zeros((batch, 1, 2), mx.int32)
     elif owned == "all":
-        indices = mx.full((4, 1, 2), count, mx.int32)
+        indices = mx.full((batch, 1, 2), count, mx.int32)
     else:
-        indices = mx.broadcast_to(mx.array([0, count + 1]), (4, 1, 2))
+        indices = mx.broadcast_to(mx.array([0, count + 1]), (batch, 1, 2))
     scores = mx.random.uniform(shape=indices.shape)
     expected = []
     # Independent route-by-route oracle, including duplicate and zero-owned routes.
-    for row in range(4):
+    for row in range(batch):
         value = mx.zeros((1, 1, config.hidden_size), mx.float32)
         for route in range(2):
             index = indices[row, 0, route].item() - count
@@ -1655,3 +1656,28 @@ def test_rejects_missing_or_invalid_signs(packed_prism_checkpoint, missing):
         weights[key] = mx.zeros_like(weights[key])
     with pytest.raises(ValueError, match="sign"):
         prism.Model(prism.ModelConfig.from_dict(config)).sanitize(weights)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("limit", [0, 10])
+def test_deepseek_v41_fused_weighted_activation_preserves_rounding(dtype, limit):
+    from mlx_vlm.models.deepseek_v41.fakequant import (
+        fake_quant_fp8_ue8m0,
+        weighted_swiglu_fp8,
+    )
+    from mlx_vlm.models.deepseek_v41.language import _swiglu
+
+    mx.random.seed(37)
+    for rows in [1, 6, 66, 2048]:
+        up = (mx.random.normal((rows, 1, 256)) * 8).astype(dtype)
+        gate = (mx.random.normal(up.shape) * 8).astype(dtype)
+        weights = mx.random.uniform(shape=(rows, 1, 1))
+        weights[::3] = 0
+        expected = fake_quant_fp8_ue8m0(
+            (_swiglu(gate, up, limit) * weights).astype(dtype)
+        )
+        actual = weighted_swiglu_fp8(up, gate, weights, limit)
+        if mx.metal.is_available():
+            assert mx.array_equal(actual, expected).item()
+        else:
+            assert actual is None

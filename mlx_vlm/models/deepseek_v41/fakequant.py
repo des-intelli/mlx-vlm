@@ -69,6 +69,68 @@ def _make_fp8_roundtrip_kernel():
 _fp8_roundtrip_kernel = _make_fp8_roundtrip_kernel()
 
 
+def _make_weighted_swiglu_fp8_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_weighted_swiglu_fp8",
+        input_names=["up", "gate", "weights", "limit"],
+        output_names=["out"],
+        ensure_row_contiguous=True,
+        source="""
+            uint i = thread_position_in_grid.x;
+            float g = float(gate[i]), u = float(up[i]);
+            if (limit[0] > 0) {
+                g = metal::min(g, limit[0]);
+                u = metal::clamp(u, -limit[0], limit[0]);
+            }
+            float activated = (g / (1.0f + metal::exp(-g))) * u;
+            // Keep checkpoint-required BF16/FP16 rounding BEFORE FP8 scaling.
+            float value = float(T(activated * weights[i / WIDTH]));
+            float amax = metal::max(metal::simd_max(metal::abs(value)), 1e-4f);
+            uint bits = as_type<uint>(amax * (1.0f / 448.0f));
+            uint exponent = (bits >> 23) + ((bits & 0x7fffff) != 0);
+            float scale = as_type<float>(exponent << 23);
+            float v = metal::clamp(value / scale, -448.0f, 448.0f);
+            uint vbits = as_type<uint>(metal::abs(v));
+            uint qexp = metal::max(int(vbits >> 23) - 3, 118);
+            float step = as_type<float>(qexp << 23);
+            out[i] = T((metal::rint(v / step) * step) * scale);
+        """,
+    )
+
+
+_weighted_swiglu_fp8_kernel = _make_weighted_swiglu_fp8_kernel()
+
+
+def weighted_swiglu_fp8(up, gate, weights, limit):
+    """Fuse routed activation, weighting, dtype rounding and FP8 round-trip.
+
+    Return None for unsupported layouts/devices so callers retain the reference
+    expression. Expert projections themselves remain MLX gather GEMMs.
+    """
+    if (
+        DISABLE
+        or _weighted_swiglu_fp8_kernel is None
+        or mx.default_device() != mx.gpu
+        or up.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or gate.dtype != up.dtype
+        or gate.shape != up.shape
+        or up.shape[-1] % 32
+        or not up.size
+        or weights.size != up.size // up.shape[-1]
+    ):
+        return None
+    return _weighted_swiglu_fp8_kernel(
+        inputs=[up, gate, weights.astype(mx.float32), mx.array([limit], mx.float32)],
+        template=[("T", up.dtype), ("WIDTH", up.shape[-1])],
+        grid=(up.size, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[up.shape],
+        output_dtypes=[up.dtype],
+    )[0]
+
+
 def _make_fp4_roundtrip_kernel():
     if not mx.metal.is_available():
         return None

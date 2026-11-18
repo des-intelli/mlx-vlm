@@ -20,7 +20,12 @@ from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .engram import Engram, EngramLayout, NgramHashState
-from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
+from .fakequant import (
+    fake_quant_fp4_e4m3,
+    fake_quant_fp4_ue8m0,
+    fake_quant_fp8_ue8m0,
+    weighted_swiglu_fp8,
+)
 from .sparse_attention import sparse_attention
 
 
@@ -436,6 +441,9 @@ class DeepseekV41SwiGLU(nn.Module):
         self.limit = limit
 
     def __call__(self, up, gate, weights):
+        fused = weighted_swiglu_fp8(up, gate, weights, self.limit)
+        if fused is not None:
+            return fused
         activated = _swiglu(gate, up, self.limit)
         # Weight before the BF16 cast and FP8 rounding of the down-projection input.
         return fake_quant_fp8_ue8m0((activated * weights).astype(up.dtype))
@@ -458,6 +466,17 @@ class DeepseekV41SwitchGLU(SwitchGLU):
         if do_sort:
             y = mx.unflatten(y[mx.argsort(order)], 0, shape)
         return y.squeeze(-2)
+
+
+@mx.compile
+def _local_expert_routes(inds, scores, start, count):
+    local = (inds >= start) & (inds < start + count)
+    return local, mx.where(local, inds - start, 0), mx.where(local, scores, 0)
+
+
+@mx.compile
+def _combine_local_experts(values, local):
+    return mx.where(local[..., None], values.astype(mx.float32), 0).sum(axis=-2)
 
 
 class DeepseekV41MoE(nn.Module):
@@ -503,16 +522,16 @@ class DeepseekV41MoE(nn.Module):
         group = self.sharding_group
         count = self.switch_mlp.gate_proj.weight.shape[0]
         start = group.rank() * count
-        local = (inds >= start) & (inds < start + count)
-        local_inds = mx.where(local, inds - start, 0)
-        local_scores = mx.where(local, scores, 0)
-        values = self.switch_mlp(x, local_inds, local_scores).astype(mx.float32)
-        routed = mx.where(local[..., None], values, 0).sum(axis=-2)
+        local, local_inds, local_scores = _local_expert_routes(
+            inds, scores, start, count
+        )
+        values = self.switch_mlp(x, local_inds, local_scores)
+        routed = _combine_local_experts(values, local)
         return mx.distributed.all_sum(routed, group=group)
 
     def _distributed_experts(self, x, inds, scores):
         """Evaluate only routes owned by this rank, then combine token outputs."""
-        if x.shape[1] == 1 and inds.size <= 64:
+        if x.shape[1] == 1 and inds.size <= 128:
             return self._distributed_decode_experts(x, inds, scores)
         group = self.sharding_group
         count = self.switch_mlp.gate_proj.weight.shape[0]
