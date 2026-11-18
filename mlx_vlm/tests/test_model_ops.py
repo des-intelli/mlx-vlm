@@ -15,10 +15,11 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
-import mlx_vlm.models.rope_utils as rope_utils
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
+
+import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.fp8 import _dequantize_fp8_weight, _quantize_fp8_weight
 from mlx_vlm.models.cache import KVCache

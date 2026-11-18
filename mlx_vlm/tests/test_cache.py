@@ -23,11 +23,12 @@ from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
-import mlx_vlm.models as models
-import mlx_vlm.turboquant as tq
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
+
+import mlx_vlm.models as models
+import mlx_vlm.turboquant as tq
 from mlx_vlm import apc as P
 from mlx_vlm import apc_adapters as A
 from mlx_vlm.apc import harvest_blocks_from_batch_cache as harvest
@@ -1528,10 +1529,11 @@ def test_prepare_left_padding_on_empty_only():
 
 class TestVisionFeatureCache:
     def test_processed_key_preserves_gemma_patch_positions(self):
+        from PIL import Image
+
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedImageProcessor,
         )
-        from PIL import Image
 
         processor = Gemma4UnifiedImageProcessor(
             do_resize=False, max_soft_tokens=8, patch_size=16, pooling_kernel_size=2

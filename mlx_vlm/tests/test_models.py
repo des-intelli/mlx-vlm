@@ -34,6 +34,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map, tree_map_with_path
+
 from mlx_vlm import embedding_loader
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
@@ -4369,6 +4370,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
 
     def test_pp_doclayout_v3_decode_order(self):
         import mlx.core as mx
+
         from mlx_vlm.models.pp_doclayout_v3.decoder import decode_order
 
         # Chain 0 -> 1 -> 2 with strong pairwise scores.
@@ -4387,6 +4389,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
 
     def test_pp_doclayout_v3_mask_to_box(self):
         import mlx.core as mx
+
         from mlx_vlm.models.pp_doclayout_v3.decoder import mask_to_box_coordinate
 
         mask = mx.zeros((1, 2, 8, 10))
@@ -4404,6 +4407,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
 
     def test_pp_doclayout_v3_bilinear_upsample(self):
         import mlx.core as mx
+
         from mlx_vlm.models.pp_doclayout_v3.encoder import upsample_bilinear2x
 
         x = mx.array([[[[0.0], [1.0]], [[2.0], [3.0]]]])
@@ -4425,6 +4429,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
         from unittest.mock import patch
 
         import mlx.core as mx
+
         from mlx_vlm.models.pp_doclayout_v3.convert import convert
 
         for dtype in (mx.float32, mx.bfloat16):
