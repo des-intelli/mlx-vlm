@@ -5332,6 +5332,85 @@ class TestQwen3_5MoeText(unittest.TestCase):
 
 
 class TestDeepseekV41EndToEnd(unittest.TestCase):
+    def test_batched_dspark_preserves_independent_draft_histories(self):
+        from mlx_vlm.speculative.drafters.deepseek_v41_dspark import (
+            Model as DraftModel,
+            ModelConfig as DraftConfig,
+        )
+
+        mx.random.seed(117)
+        config = tiny_config("deepseek_v41", sliding_window=4)
+        target = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(target, mx.float32)
+        draft = DraftModel(
+            DraftConfig(
+                text_config=config,
+                n_mtp_layers=2,
+                target_layer_ids=[0, 1],
+                mask_token_id=1,
+                markov_rank=8,
+                block_size=6,
+            )
+        ).bind(target)
+        serial = [draft.make_cache() for _ in range(5)]
+        batch = [draft.make_cache() for _ in range(5)]
+        history = [[] for _ in range(5)]
+        # Exercise initial prefill, wrapped rings, survivors, a new row and a singleton.
+        for keys, counts, width in (
+            ([0, 1, 2, 3], [1, 8, 3, 7], 5),
+            ([3, 0, 2], [2, 1, 4], 2),
+            ([4, 0, 3], [2, 2, 1], 5),
+            ([0], [3], 2),
+        ):
+            hidden = [mx.random.normal((1, n, 2 * config.hidden_size)) for n in counts]
+            for k, h in zip(keys, hidden):
+                history[k].append(h)
+            anchors = [k + 3 for k in keys]
+
+            def greedy(logits):
+                return mx.argmax(logits, axis=-1)
+
+            expected = mx.concatenate(
+                [
+                    draft.draft_block(a, h, serial[k], width + 1, greedy)
+                    for a, h, k in zip(anchors, hidden, keys)
+                ]
+            )
+            actual = draft.draft_batch_greedy(
+                anchors, hidden, [batch[k] for k in keys], width + 1, greedy
+            )
+            self.assertTrue(mx.array_equal(actual, expected).item())
+            for k in keys:
+                for a, b in zip(batch[k], serial[k]):
+                    self.assertEqual(a.offset, b.offset)
+                    self.assertEqual(a._idx, b._idx)
+                    self.assertTrue(
+                        mx.allclose(a.keys, b.keys, atol=1e-5, rtol=1e-5).item()
+                    )
+        # Rebuild a deferred request from its recent committed context at the
+        # actual position, then continue alongside a different request.
+        tails, resumed, expected = [], [], []
+        for k in (0, 3):
+            prefix = mx.concatenate(history[k], axis=1)
+            h = mx.random.normal((1, 1, 2 * config.hidden_size))
+            context = mx.concatenate([prefix, h], axis=1)
+            tails.append(context[:, -config.sliding_window :])
+            resumed.append(
+                draft.make_cache(start_position=context.shape[1] - tails[-1].shape[1])
+            )
+            expected.append(draft.draft_block(4, h, serial[k], 6, greedy))
+        got = draft.draft_batch_greedy([4, 4], tails, resumed, 6, greedy)
+        self.assertTrue(mx.array_equal(got, mx.concatenate(expected)).item())
+        for k, row in zip((0, 3), resumed):
+            for rebuilt, ref in zip(row, serial[k]):
+                self.assertEqual(
+                    rebuilt.dspark_start_position + rebuilt.offset, ref.offset
+                )
+                keys = ref._temporal_order(ref.keys)[:, :, -config.sliding_window :]
+                self.assertTrue(
+                    mx.allclose(keys, rebuilt.keys, atol=1e-5, rtol=1e-5).item()
+                )
+
     def setUp(self):
         mx.random.seed(0)
 
