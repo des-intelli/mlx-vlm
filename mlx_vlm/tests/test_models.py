@@ -5359,6 +5359,7 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         for keys, counts, width in (
             ([0, 1, 2, 3], [1, 8, 3, 7], 5),
             ([3, 0, 2], [2, 1, 4], 2),
+            ([2, 0], [1, 2], 1),
             ([4, 0, 3], [2, 2, 1], 5),
             ([0], [3], 2),
         ):
