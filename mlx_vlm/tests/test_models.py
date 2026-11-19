@@ -5332,40 +5332,6 @@ class TestQwen3_5MoeText(unittest.TestCase):
 
 
 class TestDeepseekV41EndToEnd(unittest.TestCase):
-    @unittest.skipUnless(mx.metal.is_available(), "Metal kernel")
-    def test_native_mxfp4_local_experts_match_owned_routes_and_rounding(self):
-        from mlx_vlm.models.deepseek_v41.native_experts import local_experts
-        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
-
-        model = deepseek_v41_language
-        glu = model.DeepseekV41SwitchGLU(
-            512, 256, 4, activation=model.DeepseekV41SwiGLU(10)
-        )
-        for attr, k, n in (
-            ("up_proj", 512, 256),
-            ("gate_proj", 512, 256),
-            ("down_proj", 256, 512),
-        ):
-            setattr(
-                glu,
-                attr,
-                QuantizedSwitchLinear(
-                    k, n, 4, bias=False, group_size=32, bits=4, mode="mxfp4"
-                ),
-            )
-        x = model.fake_quant_fp8_ue8m0(
-            mx.random.normal((2, 2, 512)).astype(mx.bfloat16)
-        )
-        # One row entirely outside the rank, another entirely local, and
-        # repeated local experts participating with different routing weights.
-        ids = mx.array([[[0, 1, 3], [4, 7, 5]], [[2, 7, 1], [4, 6, 4]]])
-        weights = mx.random.uniform(shape=ids.shape)
-        mask, local, scores = model._local_expert_routes(ids, weights, 4, 4)
-        expected = model._combine_local_experts(glu(x, local, scores), mask)
-        actual = local_experts(glu, x, ids, weights, 4)
-        self.assertTrue(mx.array_equal(actual, expected).item())
-        self.assertIsNone(local_experts(glu, x.astype(mx.float32), ids, weights, 4))
-
     def setUp(self):
         mx.random.seed(0)
 
@@ -5827,6 +5793,40 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 selected = mx.where(indices < 0, -mx.inf, selected)
                 best = mx.sort(expected_scores, axis=-1)[..., -indices.shape[-1] :]
                 self.assertTrue(mx.array_equal(mx.sort(selected), best).item())
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal kernel")
+    def test_native_mxfp4_local_experts_match_owned_routes_and_rounding(self):
+        from mlx_vlm.models.deepseek_v41.native_experts import local_experts
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+
+        model = deepseek_v41_language
+        glu = model.DeepseekV41SwitchGLU(
+            512, 256, 4, activation=model.DeepseekV41SwiGLU(10)
+        )
+        for attr, k, n in (
+            ("up_proj", 512, 256),
+            ("gate_proj", 512, 256),
+            ("down_proj", 256, 512),
+        ):
+            setattr(
+                glu,
+                attr,
+                QuantizedSwitchLinear(
+                    k, n, 4, bias=False, group_size=32, bits=4, mode="mxfp4"
+                ),
+            )
+        x = model.fake_quant_fp8_ue8m0(
+            mx.random.normal((2, 2, 512)).astype(mx.bfloat16)
+        )
+        # One row entirely outside the rank, another entirely local, and
+        # repeated local experts participating with different routing weights.
+        ids = mx.array([[[0, 1, 3], [4, 7, 5]], [[2, 7, 1], [4, 6, 4]]])
+        weights = mx.random.uniform(shape=ids.shape)
+        mask, local, scores = model._local_expert_routes(ids, weights, 4, 4)
+        expected = model._combine_local_experts(glu(x, local, scores), mask)
+        actual = local_experts(glu, x, ids, weights, 4)
+        self.assertTrue(mx.array_equal(actual, expected).item())
+        self.assertIsNone(local_experts(glu, x.astype(mx.float32), ids, weights, 4))
 
     def test_moe_matches_reference_activation_and_routing_precision(self):
         from mlx_vlm.models import deepseek_v41
