@@ -6030,6 +6030,81 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                         mx.allclose(actual, expected, atol=1e-4, rtol=1e-4).item()
                     )
 
+    def test_block_verification_commits_independent_ragged_rows(self):
+        config = tiny_config("deepseek_v41", sliding_window=4)
+        model = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        ids = mx.array([[3, 7, 5, 11, 19, 23, 5, 31, 2, 9, 6, 4, 8, 17, 21]])
+        for prefixes, retained in (
+            ((3, 7), (0, 6)),
+            ((4, 7), (1, 4)),
+            ((3, 3), (6, 2)),
+        ):
+            with self.subTest(prefixes=prefixes, retained=retained):
+                rows, references, inputs = [], [], []
+                for prefix, keep in zip(prefixes, retained):
+                    row = model.make_cache()[0]
+                    mx.eval(model(ids[:, :prefix], cache=[row]).logits)
+                    snapshot, metadata = row._snapshot()
+                    reference = type(row).from_state(snapshot, metadata)
+                    if keep:
+                        mx.eval(
+                            model(
+                                ids[:, prefix : prefix + keep], cache=[reference]
+                            ).logits
+                        )
+                    rows.append(row)
+                    references.append(reference)
+                    inputs.append(ids[:, prefix : prefix + 6])
+                cache = rows[0].merge(rows)
+                generation = cache.start_speculation(6, block=True)
+                with patch.object(
+                    model.layers[0].attn,
+                    "_attention",
+                    wraps=model.layers[0].attn._attention,
+                ) as attention:
+                    mx.eval(model(mx.concatenate(inputs), cache=[cache]).logits)
+                    self.assertEqual(attention.call_count, 2)
+                    cache.commit_speculation(retained, generation)
+                    self.assertEqual(attention.call_count, 2)
+                for index, (prefix, keep, reference) in enumerate(
+                    zip(prefixes, retained, references)
+                ):
+                    row = cache.extract(index)
+                    self.assertEqual(row.offset, prefix + keep)
+                    self.assertFalse(row.is_speculating)
+                    self.assertTrue(mx.array_equal(row.engram, reference.engram).item())
+                    next_ids = ids[:, prefix + keep : prefix + keep + 1]
+                    actual = model(next_ids, cache=[row]).logits
+                    expected = model(next_ids, cache=[reference]).logits
+                    self.assertTrue(
+                        mx.allclose(actual, expected, atol=1e-4, rtol=1e-4).item()
+                    )
+
+    def test_batch_block_abort_restores_rows_and_validates_all_commits(self):
+        model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        rows = [model.make_cache()[0] for _ in range(2)]
+        for row in rows:
+            mx.eval(model(mx.array([[3, 7, 11]]), cache=[row]).logits)
+        cache = rows[0].merge(rows)
+        snapshots = [row._snapshot() for row in cache.rows]
+        generation = cache.start_speculation(3, block=True)
+        mx.eval(model(mx.array([[5, 19, 23], [7, 13, 29]]), cache=[cache]).logits)
+        with self.assertRaises(ValueError):
+            cache.commit_speculation([1, 4], generation)
+        self.assertTrue(all(row.is_speculating for row in cache.rows))
+        cache.abort_speculation(generation)
+        self.assertFalse(cache.is_block_speculating)
+        for row, (state, metadata) in zip(cache.rows, snapshots):
+            self.assertEqual(row.meta_state, metadata)
+            for actual, expected in zip(row.state, state):
+                self.assertTrue(mx.array_equal(actual, expected).item())
+        cache.prepare_append([1, 2])
+        with self.assertRaises(ValueError):
+            cache.start_speculation(3, block=True)
+        self.assertFalse(any(row.is_speculating for row in cache.rows))
+
     def test_block_verification_routes_match_sorted_local_experts(self):
         from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoE
 

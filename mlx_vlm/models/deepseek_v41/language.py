@@ -1162,7 +1162,8 @@ class DeepseekV41Cache:
         """Start a rollback boundary; opt into a single batched forward with block=True.
 
         Block mode requires a populated, unpadded native cache and equal acceptance
-        lengths across its rows. BatchDeepseekV41Cache retains sequential semantics.
+        lengths across its rows. BatchDeepseekV41Cache wraps separate native
+        rows to support independent acceptance lengths.
         """
         if self.is_speculating:
             raise RuntimeError("A DeepSeek V4.1 cache transaction is already active.")
@@ -1186,6 +1187,11 @@ class DeepseekV41Cache:
     @property
     def is_block_speculating(self):
         return self.is_speculating and self._speculation.get("block", False)
+
+    def validate_block_forward(self, width):
+        transaction = self._speculation
+        if transaction["advanced"] or width != transaction["length"]:
+            raise ValueError("Block verification requires one complete forward.")
 
     def record_block_window(self, layer, values):
         if self.is_block_speculating:
@@ -1551,19 +1557,32 @@ class BatchDeepseekV41Cache:
     def is_speculating(self):
         return getattr(self, "_speculative_metadata", None) is not None
 
-    def start_speculation(self, length):
+    @property
+    def is_block_speculating(self):
+        return self.is_speculating and getattr(self, "_block_length", None) is not None
+
+    def validate_block_forward(self, width):
+        for row in self.rows:
+            row.validate_block_forward(width)
+
+    def start_speculation(self, length, *, block=False):
         if self.is_speculating:
             raise RuntimeError("A DeepSeek V4.1 cache transaction is already active.")
+        if block and (
+            any(self.left_padding) or any(x is not None for x in self._lengths)
+        ):
+            raise ValueError("Block verification requires unpadded cache rows.")
         generations = []
         try:
             for row in self.rows:
-                generations.append(row.start_speculation(length))
+                generations.append(row.start_speculation(length, block=block))
         except BaseException:
             for row, generation in zip(self.rows, generations):
                 row.abort_speculation(generation)
             raise
         self._speculative_metadata = [(self.left_padding[:], self._lengths[:])]
         self._generations = tuple(generations)
+        self._block_length = length if block else None
         return self._generations
 
     def validate_speculation(self, lengths, generation=None):
@@ -1575,6 +1594,10 @@ class BatchDeepseekV41Cache:
             row.validate_speculation([count], token)
 
     def _restore_metadata(self, lengths):
+        # Unpadded block rows have independent journals and no padding to advance.
+        # The sequential path still restores metadata at each token boundary.
+        if self.is_block_speculating:
+            lengths = [0] * len(lengths)
         self.left_padding = [
             self._speculative_metadata[n][0][i] for i, n in enumerate(lengths)
         ]
@@ -1582,6 +1605,7 @@ class BatchDeepseekV41Cache:
             self._speculative_metadata[n][1][i] for i, n in enumerate(lengths)
         ]
         self._speculative_metadata = None
+        self._block_length = None
 
     def commit_speculation(self, lengths, generation=None):
         self.validate_speculation(lengths, generation)
@@ -1793,9 +1817,7 @@ class LanguageModel(nn.Module):
             inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
         )
         if getattr(entry, "is_block_speculating", False):
-            transaction = entry._speculation
-            if transaction["advanced"] or length != transaction["length"]:
-                raise ValueError("Block verification requires one complete forward.")
+            entry.validate_block_forward(length)
         if (
             entry.is_speculating
             and not getattr(entry, "is_block_speculating", False)
