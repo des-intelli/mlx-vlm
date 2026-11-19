@@ -5955,6 +5955,157 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 for check in checks:
                     self.assertTrue(check.item())
 
+    def test_block_verification_commits_prefix_without_target_replay(self):
+        self._check_block_prefixes(batch=1)
+        self._check_block_prefixes(
+            batch=2,
+            compress_ratios=[0, 2, 2, 2, 2],
+            kv_source_layer_ids=[1],
+            index_source_layer_ids=[1, 2],
+            candidate_source_layer_id=1,
+        )
+
+    def _check_block_prefixes(self, batch, **overrides):
+        config = tiny_config("deepseek_v41", sliding_window=4, **overrides)
+        model = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        # Includes image tokens, group completion, and multiple window wraps.
+        ids = mx.array([[3, 7, 5, 11, 19, 23, 5, 31, 2, 9, 6, 4, 8, 17, 21]])
+        if batch > 1:
+            ids = mx.concatenate([ids, (ids + 2) % config.vocab_size], axis=0)
+        width = 6
+        for prefix in (1, 3, 4, 7):
+            initial = model.make_cache()[0]
+            mx.eval(model(ids[:, :prefix], cache=[initial]).logits)
+            snapshot = initial._snapshot()
+            for retained in range(width + 1):
+                with self.subTest(batch=batch, prefix=prefix, retained=retained):
+                    reference = type(initial).from_state(
+                        [mx.array(a) for a in snapshot[0]], snapshot[1]
+                    )
+                    cache = type(initial).from_state(
+                        [mx.array(a) for a in snapshot[0]], snapshot[1]
+                    )
+                    if retained:
+                        mx.eval(
+                            model(
+                                ids[:, prefix : prefix + retained], cache=[reference]
+                            ).logits
+                        )
+                    generation = cache.start_speculation(width, block=True)
+                    with patch.object(
+                        model.layers[0].attn,
+                        "_attention",
+                        wraps=model.layers[0].attn._attention,
+                    ) as attention:
+                        mx.eval(
+                            model(ids[:, prefix : prefix + width], cache=[cache]).logits
+                        )
+                        self.assertEqual(attention.call_count, 1)
+                        buffers = list(cache._compress_buffers)
+                        cache.commit_speculation([retained] * batch, generation)
+                        if retained:
+                            for before, after in zip(buffers, cache._compress_buffers):
+                                self.assertIs(before, after)
+                        self.assertEqual(attention.call_count, 1)
+                    self.assertEqual(cache.offset, prefix + retained)
+                    self.assertFalse(cache.is_speculating)
+                    self.assertTrue(
+                        mx.array_equal(cache.engram, reference.engram).item()
+                    )
+                    for actual, expected in zip(cache._slots, reference._slots):
+                        for a, b in zip(actual, expected):
+                            self.assertEqual(a is None, b is None)
+                            if a is not None:
+                                self.assertEqual(a.shape, b.shape)
+                                self.assertTrue(
+                                    mx.allclose(
+                                        a, b, atol=1e-4, rtol=1e-4, equal_nan=True
+                                    ).item()
+                                )
+                    next_ids = ids[:, prefix + retained : prefix + retained + 1]
+                    expected = model(next_ids, cache=[reference]).logits
+                    actual = model(next_ids, cache=[cache]).logits
+                    self.assertTrue(
+                        mx.allclose(actual, expected, atol=1e-4, rtol=1e-4).item()
+                    )
+
+    def test_block_verification_routes_match_sorted_local_experts(self):
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoE
+
+        config = tiny_config("deepseek_v41")
+        moe = DeepseekV41MoE(config)
+        # Emulate a rank owning half the experts. The all-sum is identity so
+        # each rank's local contribution can be checked independently.
+        moe.sharding_group = NS(rank=lambda: 1, size=lambda: 2)
+        count = config.n_routed_experts // 2
+        for linear in (
+            moe.switch_mlp.gate_proj,
+            moe.switch_mlp.up_proj,
+            moe.switch_mlp.down_proj,
+        ):
+            linear.weight = linear.weight[:count]
+        for batch, width in ((1, 3), (1, 6), (2, 6)):
+            with self.subTest(batch=batch, width=width):
+                x = mx.random.normal((batch, width, config.hidden_size))
+                indices = mx.random.randint(
+                    0,
+                    config.n_routed_experts,
+                    (batch, width, config.num_experts_per_tok),
+                )
+                weights = mx.random.uniform(shape=indices.shape)
+                with patch(
+                    "mlx.core.distributed.all_sum",
+                    side_effect=lambda value, **kwargs: value,
+                ):
+                    expected = moe._distributed_experts(x, indices, weights)
+                    with patch.object(
+                        moe,
+                        "_distributed_decode_experts",
+                        wraps=moe._distributed_decode_experts,
+                    ) as dispatch:
+                        actual = moe._distributed_experts(
+                            x, indices, weights, block_verify=True
+                        )
+                        self.assertEqual(dispatch.call_count, 1)
+                self.assertTrue(
+                    mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+                )
+
+    def test_block_verification_transaction_lifetime(self):
+        config = tiny_config("deepseek_v41")
+        model = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        cache = model.make_cache()[0]
+        with self.assertRaises(ValueError):
+            cache.start_speculation(3, block=True)
+        mx.eval(model(mx.array([[3, 7, 11]]), cache=[cache]).logits)
+        snapshot = cache._snapshot()
+        generation = cache.start_speculation(3, block=True)
+        with self.assertRaises(RuntimeError):
+            cache.commit_speculation([1], generation)
+        with self.assertRaises(RuntimeError):
+            cache.start_speculation(3, block=True)
+        with self.assertRaises(ValueError):
+            model(mx.array([[5, 19]]), cache=[cache])
+        self.assertEqual(cache.offset, 3)
+        mx.eval(model(mx.array([[5, 19, 23]]), cache=[cache]).logits)
+        with self.assertRaises(ValueError):
+            model(mx.array([[5]]), cache=[cache])
+        self.assertEqual(cache.offset, 6)
+        for lengths, token, error in (
+            ([4], generation, ValueError),
+            ([1], generation - 1, RuntimeError),
+        ):
+            with self.assertRaises(error):
+                cache.commit_speculation(lengths, token)
+        cache.abort_speculation(generation)
+        self.assertEqual(cache.meta_state, snapshot[1])
+        for a, b in zip(cache.state, snapshot[0]):
+            self.assertTrue(mx.array_equal(a, b).item())
+        with self.assertRaises(RuntimeError):
+            cache.commit_speculation([1], generation)
+
     def test_selected_logits_preserve_chunked_cache_and_decode(self):
         config = tiny_config("deepseek_v41")
         model = deepseek_v41_language.LanguageModel(config)

@@ -281,6 +281,7 @@ class Indexer(nn.Module):
             if latent is not None:
                 self._publish_keys(latent, start_pos, cache)
             cache.index_k = cache.keys[self.layer_idx]
+            cache.record_block_handoff("index_k", cache.index_k, ratio, "pool")
 
         cos, sin = _index_cos_sin(
             end_pos, self.rope_head_dim, self.rope_theta, self.yarn
@@ -315,6 +316,8 @@ class Indexer(nn.Module):
                 self.candidate_topk_blocks,
                 self.candidate_block_size,
             )
+
+            cache.record_block_handoff("candidates", cache.candidates, ratio, "mask")
 
         topk = min(self.index_topk, end_pos // ratio)
         idxs = mx.sort(mx.argsort(-scores, axis=-1)[..., :topk], axis=-1).astype(
@@ -514,7 +517,7 @@ class DeepseekV41MoE(nn.Module):
         self.sharding_group = None
 
     def _distributed_decode_experts(self, x, inds, scores):
-        """Keep small decode dispatch on-device with zero-weight non-local routes.
+        """Keep small decode/verification dispatch on-device with zero non-local weights.
 
         Non-local routes reuse local expert zero with zero weight, avoiding a
         route sort, scatter buffer, or variable-sized dispatch with CPU readback.
@@ -530,9 +533,9 @@ class DeepseekV41MoE(nn.Module):
         routed = _combine_local_experts(values, local)
         return mx.distributed.all_sum(routed, group=group)
 
-    def _distributed_experts(self, x, inds, scores):
+    def _distributed_experts(self, x, inds, scores, *, block_verify=False):
         """Evaluate only routes owned by this rank, then combine token outputs."""
-        if x.shape[1] == 1 and inds.size <= 128:
+        if (x.shape[1] == 1 or block_verify) and inds.size <= 128:
             return self._distributed_decode_experts(x, inds, scores)
         group = self.sharding_group
         count = self.switch_mlp.gate_proj.weight.shape[0]
@@ -552,13 +555,17 @@ class DeepseekV41MoE(nn.Module):
         routed = routed.reshape(*inds.shape, x.shape[-1]).sum(-2)
         return mx.distributed.all_sum(routed, group=group)
 
-    def __call__(self, x: mx.array, image_mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, image_mask: Optional[mx.array] = None, *, block_verify=False
+    ) -> mx.array:
         inds, scores = self.gate(x, image_mask)
         rounded = fake_quant_fp8_ue8m0(x)
         if self.sharding_group is None:
             y = self.switch_mlp(rounded, inds, scores).astype(mx.float32).sum(-2)
         else:
-            y = self._distributed_experts(rounded, inds, scores)
+            y = self._distributed_experts(
+                rounded, inds, scores, block_verify=block_verify
+            )
         return (y + self.shared_experts(x).astype(mx.float32)).astype(x.dtype)
 
 
@@ -678,6 +685,7 @@ class DeepseekV41Attention(nn.Module):
             part = mx.concatenate([history, kv], axis=1)
         else:
             part = kv
+        cache.record_block_window(self.layer_idx, kv)
         end_pos = start_pos + seqlen
         retained = min(seqlen, win)
         buffer[:batch, mx.arange(end_pos - retained, end_pos) % win] = kv[:, -retained:]
@@ -695,6 +703,7 @@ class DeepseekV41Attention(nn.Module):
         ratio = self.compress_ratio
         latent = None
         if self.is_kv_source:
+            cache.record_block_ratio(self.layer_idx, ratio)
             latent = self.compressor(x, start_pos, cache)
             if latent is not None:
                 n_latent = latent.shape[1]
@@ -711,6 +720,9 @@ class DeepseekV41Attention(nn.Module):
                 pool_kv = fake_quant_fp4_e4m3(pool_kv)
                 cache.append_compressed(self.layer_idx, pool_kv)
             cache.compress_kv = cache.compress[self.layer_idx]
+            cache.record_block_handoff(
+                "compress_kv", cache.compress_kv, ratio, "pool", always=True
+            )
         compress_len = (start_pos + seqlen) // ratio
         if compress_len == 0 or cache.compress_kv is None:
             pool = mx.zeros((batch, 0, self.head_dim), dtype=x.dtype)
@@ -719,6 +731,7 @@ class DeepseekV41Attention(nn.Module):
         if self.is_index_source:
             idxs = self.indexer(x, qr, latent, start_pos, 0, cache)
             cache.topk_idxs = idxs
+            cache.record_block_handoff("topk_idxs", idxs, ratio, "indices")
         else:
             idxs = cache.topk_idxs
         if idxs is None:
@@ -904,6 +917,7 @@ class Compressor(nn.Module):
                 cache.score_state[i] = self._write_slot(
                     cache.score_state[i], batch, slot, score[:, n : n + 1, :]
                 )
+                cache.record_block_compressor(i)
                 if (pos + 1) % ratio == 0:
                     pooled.append(
                         (
@@ -1034,7 +1048,9 @@ class DeepseekV41Block(nn.Module):
         )
         x = self.hc_pre(x, attn_pre)
         x = self.ffn_norm(x)
-        x = self.ffn(x, image_mask)
+        x = self.ffn(
+            x, image_mask, block_verify=getattr(cache, "is_block_speculating", False)
+        )
         x = hc_expand(x, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 
@@ -1115,6 +1131,13 @@ class DeepseekV41Cache:
         return function(self, *arrays)
 
     def advance(self, width):
+        if self.is_block_speculating:
+            transaction = self._speculation
+            if transaction["advanced"] or width != transaction["length"]:
+                raise ValueError("Block verification requires one complete forward.")
+            transaction["advanced"] = True
+            self.offset += width
+            return
         self.offset += width
         if self.is_speculating:
             if width not in (0, 1):
@@ -1135,14 +1158,117 @@ class DeepseekV41Cache:
         # Copies are lazy, but detach published views from subsequent buffer writes.
         return [mx.array(value) for value in self.state], self.meta_state
 
-    def start_speculation(self, length):
+    def start_speculation(self, length, *, block=False):
+        """Start a rollback boundary; opt into a single batched forward with block=True.
+
+        Block mode requires a populated, unpadded native cache and equal acceptance
+        lengths across its rows. BatchDeepseekV41Cache retains sequential semantics.
+        """
         if self.is_speculating:
             raise RuntimeError("A DeepSeek V4.1 cache transaction is already active.")
         if length < 1:
             raise ValueError("Speculative cache length must be positive.")
+        if block and (self.offset == 0 or any(value is None for value in self.window)):
+            raise ValueError("Block verification requires a populated cache.")
         self._generation = getattr(self, "_generation", 0) + 1
         self._speculation = {"length": length, "history": [self._snapshot()]}
+        if block:
+            self._speculation.update(
+                block=True,
+                advanced=False,
+                windows={},
+                compressors={},
+                ratios={},
+                handoffs=[],
+            )
         return self._generation
+
+    @property
+    def is_block_speculating(self):
+        return self.is_speculating and self._speculation.get("block", False)
+
+    def record_block_window(self, layer, values):
+        if self.is_block_speculating:
+            self._speculation["windows"][layer] = values
+
+    def record_block_ratio(self, layer, ratio):
+        if self.is_block_speculating:
+            self._speculation["ratios"][layer] = ratio
+
+    def record_block_compressor(self, layer):
+        if self.is_block_speculating:
+            self._speculation["compressors"].setdefault(layer, []).append(
+                (self.kv_state[layer], self.score_state[layer])
+            )
+
+    def record_block_handoff(self, name, value, ratio, kind, always=False):
+        if self.is_block_speculating:
+            self._speculation["handoffs"].append((name, value, ratio, kind, always))
+
+    def _commit_block_prefix(self, length):
+        """Commit projected state, without replaying target weights.
+
+        The journal holds incoming ring values and the compressor's small partial
+        groups. Growing pools are sliced to completed groups; query handoffs keep
+        the final retained query. The sequential transaction remains the default.
+        This opt-in mode accepts one full, unpadded verification forward.
+        """
+        transaction = self._speculation
+        if length == transaction["length"]:
+            self._speculation = None
+            return
+        final_compress, final_keys, final_engram = self.compress, self.keys, self.engram
+        compress_buffers, key_buffers = self._compress_buffers, self._key_buffers
+        self.state, self.meta_state = transaction["history"][0]
+        if length:
+            end = self.offset + length
+            for layer, values in transaction["windows"].items():
+                buffer = self.window[layer]
+                if buffer is None:
+                    raise RuntimeError(
+                        "Block verification requires a populated window."
+                    )
+                buffer = mx.array(buffer)
+                count = min(length, buffer.shape[1])
+                buffer[
+                    : values.shape[0], mx.arange(end - count, end) % buffer.shape[1]
+                ] = values[:, length - count : length]
+                self.window[layer] = buffer
+            for layer, history in transaction["compressors"].items():
+                self.kv_state[layer], self.score_state[layer] = history[length - 1]
+            for layer, ratio in transaction["ratios"].items():
+                count = end // ratio
+                for target, source, buffers, allocated in (
+                    (
+                        self.compress,
+                        final_compress,
+                        self._compress_buffers,
+                        compress_buffers,
+                    ),
+                    (self.keys, final_keys, self._key_buffers, key_buffers),
+                ):
+                    value = source[layer]
+                    target[layer] = (
+                        value[:, :count] if count and value is not None else None
+                    )
+                    # Unaccepted slots are invisible and overwritten on append.
+                    # Keep allocation slack instead of copying the context again.
+                    buffers[layer] = allocated[layer]
+            if final_engram is not None:
+                self.engram = final_engram[:, :end]
+            for name, value, ratio, kind, always in transaction["handoffs"]:
+                count = end // ratio
+                if not count and not always:
+                    continue
+                if value is None or not count:
+                    value = None
+                elif kind == "pool":
+                    value = value[:, :count]
+                else:
+                    value = value[:, length - 1 : length, :count]
+                setattr(self, name, value)
+            self.offset = end
+        self._speculation = None
 
     def validate_speculation(self, lengths, generation=None):
         if not self.is_speculating or generation not in (None, self._generation):
@@ -1152,6 +1278,10 @@ class DeepseekV41Cache:
         total = self._speculation["length"]
         if not 0 <= lengths[0] <= total:
             raise ValueError("Acceptance is outside the speculative window.")
+        if self.is_block_speculating:
+            if not self._speculation["advanced"]:
+                raise RuntimeError("Block verification has not completed.")
+            return
         if len(self._speculation["history"]) != total + 1:
             raise RuntimeError("Cache history does not cover the speculative window.")
 
@@ -1161,7 +1291,10 @@ class DeepseekV41Cache:
 
     def commit_speculation(self, lengths, generation=None):
         self.validate_speculation(lengths, generation)
-        self._restore_speculation(lengths[0])
+        if self.is_block_speculating:
+            self._commit_block_prefix(lengths[0])
+        else:
+            self._restore_speculation(lengths[0])
 
     def abort_speculation(self, generation=None):
         if self.is_speculating:
@@ -1659,7 +1792,15 @@ class LanguageModel(nn.Module):
         length = (
             inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
         )
-        if entry.is_speculating and length > 1:
+        if getattr(entry, "is_block_speculating", False):
+            transaction = entry._speculation
+            if transaction["advanced"] or length != transaction["length"]:
+                raise ValueError("Block verification requires one complete forward.")
+        if (
+            entry.is_speculating
+            and not getattr(entry, "is_block_speculating", False)
+            and length > 1
+        ):
             # Compression, window eviction and Engram all have token boundaries.
             # Record ordinary decode transitions so every accepted prefix is exact.
             def at(value, index):
