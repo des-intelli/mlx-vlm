@@ -5333,8 +5333,8 @@ class TestQwen3_5MoeText(unittest.TestCase):
 
 class TestDeepseekV41EndToEnd(unittest.TestCase):
     def test_batched_dspark_preserves_independent_draft_histories(self):
+        from mlx_vlm.speculative.drafters.deepseek_v41_dspark import Model as DraftModel
         from mlx_vlm.speculative.drafters.deepseek_v41_dspark import (
-            Model as DraftModel,
             ModelConfig as DraftConfig,
         )
 
