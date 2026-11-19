@@ -6058,15 +6058,16 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                     inputs.append(ids[:, prefix : prefix + 6])
                 cache = rows[0].merge(rows)
                 generation = cache.start_speculation(6, block=True)
+                layer = model.layers[0].attn
+                method = "_ragged_attention" if layer.ragged_decode else "_attention"
+                calls = 1 if layer.ragged_decode else len(rows)
                 with patch.object(
-                    model.layers[0].attn,
-                    "_attention",
-                    wraps=model.layers[0].attn._attention,
+                    layer, method, wraps=getattr(layer, method)
                 ) as attention:
                     mx.eval(model(mx.concatenate(inputs), cache=[cache]).logits)
-                    self.assertEqual(attention.call_count, 2)
+                    self.assertEqual(attention.call_count, calls)
                     cache.commit_speculation(retained, generation)
-                    self.assertEqual(attention.call_count, 2)
+                    self.assertEqual(attention.call_count, calls)
                 for index, (prefix, keep, reference) in enumerate(
                     zip(prefixes, retained, references)
                 ):
@@ -6080,6 +6081,63 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                     self.assertTrue(
                         mx.allclose(actual, expected, atol=1e-4, rtol=1e-4).item()
                     )
+
+    def test_ragged_attention_batches_ring_updates_and_partial_commits(self):
+        config = tiny_config(
+            "deepseek_v41",
+            sliding_window=4,
+            compress_ratios=[0, 2, 2, 2, 2],
+            kv_source_layer_ids=[1],
+            index_source_layer_ids=[1, 2],
+            candidate_source_layer_id=1,
+        )
+        model = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        for layer in model.layers:
+            layer.attn.ragged_decode = True
+        ids = mx.array([[3, 7, 5, 11, 19, 23, 5, 31, 2, 9, 6, 4, 8, 17, 21]])
+        prefixes = [1, 4, 7]
+        for width, retained in [(1, [1, 1, 1]), (6, [0, 3, 6])]:
+            rows, refs, blocks, expected = [], [], [], []
+            for i, prefix in enumerate(prefixes):
+                row = model.make_cache()[0]
+                mx.eval(model(ids[:, :prefix], cache=[row]).logits)
+                state, metadata = row._snapshot()
+                ref = type(row).from_state(state, metadata)
+                full = type(row).from_state([mx.array(v) for v in state], metadata)
+                block = ids[:, prefix : prefix + width]
+                expected.append(model(block, cache=[full]).logits)
+                if retained[i]:
+                    mx.eval(model(block[:, : retained[i]], cache=[ref]).logits)
+                rows.append(row)
+                refs.append(ref)
+                blocks.append(block)
+            cache = rows[0].merge(rows)
+            gen = cache.start_speculation(width, block=True) if width > 1 else None
+            with patch.object(
+                model.layers[0].attn,
+                "_ragged_attention",
+                wraps=model.layers[0].attn._ragged_attention,
+            ) as batched:
+                got = model(mx.concatenate(blocks), cache=[cache]).logits
+                self.assertTrue(
+                    mx.allclose(
+                        got, mx.concatenate(expected), atol=1e-4, rtol=1e-4
+                    ).item()
+                )
+                batched.assert_called_once()
+            if gen is not None:
+                cache.commit_speculation(retained, gen)
+            for row, ref in zip(cache.rows, refs):
+                self.assertEqual(row.offset, ref.offset)
+                self.assertTrue(
+                    mx.allclose(
+                        model(ids[:, -1:], cache=[row]).logits,
+                        model(ids[:, -1:], cache=[ref]).logits,
+                        atol=1e-4,
+                        rtol=1e-4,
+                    ).item()
+                )
 
     def test_batch_block_abort_restores_rows_and_validates_all_commits(self):
         model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))

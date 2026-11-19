@@ -6,7 +6,7 @@ and the per-head attention sink. KV is shared between keys and values (MLA).
 """
 
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Union
 
 import mlx.core as mx
 
@@ -21,10 +21,10 @@ _DECODE_PREFIX = r"""
 
 _DECODE_ACCUMULATE = r"""    int length = sizes[0];
     int window_length = sizes[1];
-    int pool_length = sizes[2];
     int qi = row % length;
     int head = (row / length) % HEADS;
     int batch = row / (length * HEADS);
+    /* row pool */
     int mask_batch = BATCH_MASK ? batch : 0;
     int window_end = window_length - length + qi;
     int indices_offset = (batch * length + qi) * TOPK;
@@ -47,13 +47,13 @@ _DECODE_ACCUMULATE = r"""    int length = sizes[0];
         if (local && valid) {
             valid = mask[(mask_batch * length + qi) * window_length + pos];
         }
-        int offset = (batch * (local ? window_length : pool_length) + pos) * DIM
+        int offset = ((local ? batch * window_length : 0) + pos) * DIM
                      + lane;
         float score = -3.4028234663852886e38f;
         if (valid) {
             score = 0;
             for (int d = 0; d < PER_THREAD; ++d) {
-                float value = local ? float(window[offset + d * WIDTH]) : float(pool[offset + d * WIDTH]);
+                float value = local ? float(window[offset + d * WIDTH]) : float(row_pool[offset + d * WIDTH]);
                 score += q[d] * value;
             }
             score = simd_sum(score);
@@ -66,7 +66,7 @@ _DECODE_ACCUMULATE = r"""    int length = sizes[0];
         for (int d = 0; d < PER_THREAD; ++d) {
             acc[d] *= correction;
             if (valid) {
-                float value = local ? float(window[offset + d * WIDTH]) : float(pool[offset + d * WIDTH]);
+                float value = local ? float(window[offset + d * WIDTH]) : float(row_pool[offset + d * WIDTH]);
                 acc[d] += weight * value;
             }
         }
@@ -107,10 +107,11 @@ _PREFILL_SOURCE = r"""
     uint tile = threadgroup_position_in_grid.y;
     uint sg = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
-    int length = sizes[0], wl = sizes[1], pl = sizes[2];
+    int length = sizes[0], wl = sizes[1];
     int qi = tile % length;
     int head_base = ((tile / length) % (HEADS / 8)) * 8;
     int batch = tile / (length * (HEADS / 8));
+    /* row pool */
     int mask_batch = BATCH_MASK ? batch : 0;
     int end = wl - length + qi;
     int io = (batch * length + qi) * TOPK;
@@ -137,9 +138,9 @@ _PREFILL_SOURCE = r"""
             local[e] = entry < WINDOW;
             int pos = local[e] ? end - WINDOW + 1 + entry
                               : (entry < WINDOW + TOPK ? indices[io + entry - WINDOW] : -1);
-            valid[e] = pos >= 0 && pos < (local[e] ? wl : pl);
+            valid[e] = pos >= 0 && pos < (local[e] ? wl : pool_length);
             if (local[e] && valid[e]) valid[e] = mask[(mask_batch * length + qi) * wl + pos];
-            offsets[e] = (batch * (local[e] ? wl : pl) + pos) * DIM;
+            offsets[e] = ((local[e] ? batch * wl : 0) + pos) * DIM;
         }
         simdgroup_matrix<float, 8, 8> scores;
         scores.thread_elements()[0] = 0;
@@ -148,7 +149,7 @@ _PREFILL_SOURCE = r"""
             simdgroup_matrix<float, 8, 8> a, b;
             for (int e = 0; e < 2; ++e) {
                 a.thread_elements()[e] = float(queries[((batch * HEADS + head_base + fr) * length + qi) * DIM + d + fc + e]) * scale[0];
-                b.thread_elements()[e] = valid[e] ? (local[e] ? float(window[offsets[e] + d + fr]) : float(pool[offsets[e] + d + fr])) : 0;
+                b.thread_elements()[e] = valid[e] ? (local[e] ? float(window[offsets[e] + d + fr]) : float(row_pool[offsets[e] + d + fr])) : 0;
             }
             simdgroup_multiply_accumulate(scores, a, b, scores);
         }
@@ -178,14 +179,14 @@ _PREFILL_SOURCE = r"""
             bool is_local = entry < WINDOW;
             int pos = is_local ? end - WINDOW + 1 + entry
                                : (entry < WINDOW + TOPK ? indices[io + entry - WINDOW] : -1);
-            bool exists = pos >= 0 && pos < (is_local ? wl : pl);
-            int offset = (batch * (is_local ? wl : pl) + pos) * DIM + sg * COLS;
+            bool exists = pos >= 0 && pos < (is_local ? wl : pool_length);
+            int offset = ((is_local ? batch * wl : 0) + pos) * DIM + sg * COLS;
             simdgroup_matrix<float, 8, 8> a;
             for (int e = 0; e < 2; ++e) a.thread_elements()[e] = weights[fr * BK + k + fc + e];
             for (int t = 0; t < COLS / 8; ++t) {
                 simdgroup_matrix<float, 8, 8> b;
                 for (int e = 0; e < 2; ++e) {
-                    b.thread_elements()[e] = exists ? (is_local ? float(window[offset + t * 8 + fc + e]) : float(pool[offset + t * 8 + fc + e])) : 0;
+                    b.thread_elements()[e] = exists ? (is_local ? float(window[offset + t * 8 + fc + e]) : float(row_pool[offset + t * 8 + fc + e])) : 0;
                 }
                 simdgroup_multiply_accumulate(accumulators[t], a, b, accumulators[t]);
             }
@@ -200,14 +201,34 @@ _PREFILL_SOURCE = r"""
 """
 
 
-@lru_cache(maxsize=2)
-def _kernel(prefill=False):
+def _pool_arguments(source, pool_count):
+    if pool_count == 0:
+        names = ["pool"]
+        select = "int pool_length = sizes[2]; auto row_pool = pool + batch * pool_length * DIM;"
+    else:
+        names = [f"pool{i}" for i in range(pool_count)]
+        cases = "\n".join(
+            f"case {i}: row_pool = {name}; break;"
+            for i, name in enumerate(names[1:], 1)
+        )
+        select = (
+            "int pool_length = sizes[2 + batch]; auto row_pool = pool0; "
+            "switch(batch) {" + cases + "}"
+        )
+    return names, source.replace("/* row pool */", select)
+
+
+@lru_cache(maxsize=18)
+def _kernel(prefill=False, pool_count=0):
+    names, source = _pool_arguments(_PREFILL_SOURCE if prefill else _SOURCE, pool_count)
     return mx.fast.metal_kernel(
-        name="deepseek_v41_sparse_attention" + ("_prefill" if prefill else "_vector"),
+        name="deepseek_v41_sparse_attention"
+        + ("_prefill" if prefill else "_vector")
+        + f"_p{pool_count}",
         input_names=[
             "queries",
             "window",
-            "pool",
+            *names,
             "indices",
             "mask",
             "sinks",
@@ -216,15 +237,15 @@ def _kernel(prefill=False):
         ],
         output_names=["out"],
         header="#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n",
-        source=_PREFILL_SOURCE if prefill else _SOURCE,
+        source=source,
     )
 
 
 @lru_cache(maxsize=128)
-def _scalars(scale: float, length: int, window_length: int, pool_length: int):
+def _scalars(scale, length, window_length, pool_lengths):
     return (
         mx.array([scale], mx.float32),
-        mx.array([length, window_length, pool_length], mx.int32),
+        mx.array([length, window_length, *pool_lengths], mx.int32),
     )
 
 
@@ -262,14 +283,17 @@ _SPLIT_MERGE_PREFIX = r"""
 """
 
 
-@lru_cache(maxsize=1)
-def _split_kernels():
+@lru_cache(maxsize=9)
+def _split_kernels(pool_count=0):
+    names, source = _pool_arguments(
+        _SPLIT_PREFIX + _DECODE_ACCUMULATE + _SPLIT_STORE, pool_count
+    )
     partial = mx.fast.metal_kernel(
-        name="deepseek_v41_sparse_decode_partial",
+        name=f"deepseek_v41_sparse_decode_partial_p{pool_count}",
         input_names=[
             "queries",
             "window",
-            "pool",
+            *names,
             "indices",
             "mask",
             "sinks",
@@ -277,7 +301,7 @@ def _split_kernels():
             "sizes",
         ],
         output_names=["out", "stats"],
-        source=_SPLIT_PREFIX + _DECODE_ACCUMULATE + _SPLIT_STORE,
+        source=source,
     )
     merge = mx.fast.metal_kernel(
         name="deepseek_v41_sparse_decode_merge",
@@ -288,17 +312,27 @@ def _split_kernels():
     return partial, merge
 
 
-def _split_decode(queries, window, pool, indices, mask, sinks, scale, window_size):
+def _split_decode(
+    queries,
+    window,
+    pool_inputs,
+    indices,
+    mask,
+    sinks,
+    scale_array,
+    sizes,
+    window_size,
+    pool_count,
+):
     batch, heads, length, dim = queries.shape
     rows = batch * heads
-    partial, merge = _split_kernels()
-    scale_array, sizes = _scalars(float(scale), length, window.shape[1], pool.shape[1])
+    partial, merge = _split_kernels(pool_count)
     sinks = sinks.astype(mx.float32)
     raw, stats = partial(
         inputs=[
             mx.contiguous(queries),
             mx.contiguous(window),
-            mx.contiguous(pool),
+            *pool_inputs,
             mx.contiguous(indices.astype(mx.int32)),
             mx.contiguous(mask),
             sinks,
@@ -331,7 +365,7 @@ def _split_decode(queries, window, pool, indices, mask, sinks, scale, window_siz
 def sparse_attention(
     queries: mx.array,
     window: mx.array,
-    pool: mx.array,
+    pool: Union[mx.array, tuple[mx.array, ...]],
     indices: mx.array,
     mask: mx.array,
     sinks: mx.array,
@@ -342,7 +376,9 @@ def sparse_attention(
 
     Queries are [B,H,L,D], window/pool are [B,K,D], indices are [B,L,S].
     The window ends at the last query and includes up to ``window_size`` keys
-    per query. Its boolean mask is [1 or B,1,L,K]; indices of -1 are ignored.
+    per query. A tuple of up to eight [1,K_i,D] pools binds each row directly
+    without copying independent request caches into a padded array.
+    Its boolean mask is [1 or B,1,L,K]; indices of -1 are ignored.
     Scores, the shared softmax (including sinks), and values accumulate in FP32.
     """
     if (
@@ -350,24 +386,32 @@ def sparse_attention(
         or not mx.metal.is_available()
         or queries.ndim != 4
         or window.ndim != 3
-        or pool.ndim != 3
         or indices.ndim != 3
         or queries.dtype not in (mx.bfloat16, mx.float16)
         or window.dtype != queries.dtype
-        or pool.dtype != queries.dtype
         or mask is None
         or mask.dtype != mx.bool_
     ):
         return None
     batch, heads, length, dim = queries.shape
+    separate = isinstance(pool, tuple)
+    pools = pool if separate else (pool,)
+    pool_count = len(pools) if separate else 0
+    if separate and (pool_count != batch or not 1 <= pool_count <= 8):
+        return None
     if (
         min(batch, heads, length, dim, window_size) <= 0
         or dim % 32
         or dim > 512
         or window.shape[0] != batch
-        or pool.shape[0] != batch
         or window.shape[-1] != dim
-        or pool.shape[-1] != dim
+        or any(
+            p.ndim != 3
+            or p.shape[0] != (1 if separate else batch)
+            or p.shape[-1] != dim
+            or p.dtype != queries.dtype
+            for p in pools
+        )
         or window.shape[1] < length
         or indices.shape[:2] != (batch, length)
         or indices.dtype not in (mx.int32, mx.int64)
@@ -376,19 +420,33 @@ def sparse_attention(
         or sinks.shape != (heads,)
     ):
         return None
+    scale_array, sizes = _scalars(
+        float(scale), length, window.shape[1], tuple(p.shape[1] for p in pools)
+    )
+    # Empty arrays use the Metal constant address space in MLX. Bind an existing
+    # nonempty buffer for these rows. Their logical length of zero prevents reads.
+    pool_inputs = [mx.contiguous(p) if p.shape[1] else window for p in pools]
     if length == 1 and batch >= 4 and dim == 512 and indices.shape[-1] >= 512:
         return _split_decode(
-            queries, window, pool, indices, mask, sinks, scale, window_size
+            queries,
+            window,
+            pool_inputs,
+            indices,
+            mask,
+            sinks,
+            scale_array,
+            sizes,
+            window_size,
+            pool_count,
         )
-    prefill = length > 1 and heads % 8 == 0 and pool.shape[1] > 0
+    prefill = length > 1 and heads % 8 == 0 and any(p.shape[1] for p in pools)
     threads = 128 if prefill else 256
     rows = batch * heads * length // (8 if prefill else 1)
-    scale_array, sizes = _scalars(float(scale), length, window.shape[1], pool.shape[1])
-    return _kernel(prefill)(
+    return _kernel(prefill, pool_count)(
         inputs=[
             mx.contiguous(queries),
             mx.contiguous(window),
-            mx.contiguous(pool),
+            *pool_inputs,
             mx.contiguous(indices.astype(mx.int32)),
             mx.contiguous(mask),
             sinks.astype(mx.float32),

@@ -4016,6 +4016,29 @@ def test_deepseek_v41_sparse_attention_unsupported_inputs_return_none():
     assert deepseek_v41_sparse_attention(*args) is None
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "width,heads,dim,topk", [(1, 4, 64, 7), (1, 8, 512, 512), (6, 8, 512, 33)]
+)
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_sparse_attention_binds_independent_pool_views(
+    dtype, width, heads, dim, topk
+):
+    args = list(_deepseek_v41_sparse_inputs(4, heads, width, dim, 9, topk, dtype))
+    lengths = (0, 11, 31, 6)
+    pools = tuple(args[2][i : i + 1, 3 : 3 + n] for i, n in enumerate(lengths))
+    indices = args[3] % 31
+    args[2] = mx.concatenate(
+        [mx.pad(p, [(0, 0), (0, 31 - n), (0, 0)]) for p, n in zip(pools, lengths)]
+    )
+    args[3] = mx.where(indices < mx.array(lengths)[:, None, None], indices, -1)
+    args[4] = args[4] & (mx.arange(4)[:, None, None, None] != 2)
+    expected = deepseek_v41_sparse_attention(*args)
+    args[2], args[3] = pools, indices
+    actual = deepseek_v41_sparse_attention(*args)
+    assert mx.array_equal(actual, expected).item()
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("batch", [4, 8])
 @pytest.mark.parametrize("masked", [False, True])
