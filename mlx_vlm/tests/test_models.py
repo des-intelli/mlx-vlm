@@ -8391,3 +8391,20 @@ def test_deepseek_v41_invalid_shard_preserves_parameters():
         model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
     after = dict(tree_flatten(model.parameters()))
     assert all(after[k] is v for k, v in before.items())
+
+
+def test_deepseek_v41_can_return_rank_local_vocabulary_after_prefill():
+    config = tiny_config("deepseek_v41")
+    model = deepseek_v41_language.LanguageModel(config)
+    _prepare_deepseek_v41_distributed(model, mx.float32)
+    ids = mx.array([[1, 2, 3]])
+    full = model(ids).logits
+    mid = config.vocab_size // 2
+    model.head.weight = model.head.weight[mid:]
+    model.head.sharding_group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    with patch.object(mx.distributed, "all_gather", side_effect=AssertionError):
+        cache = model.make_cache()
+        empty = model(ids[:, :2], cache=cache, logits_to_keep=0, local_vocab=True)
+        assert empty.logits.shape == (1, 0, config.vocab_size - mid)
+        last = model(ids[:, 2:], cache=cache, logits_to_keep=1, local_vocab=True)
+    np.testing.assert_allclose(last.logits, full[:, -1:, mid:], rtol=1e-4, atol=1e-4)
