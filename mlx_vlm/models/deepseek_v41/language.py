@@ -824,14 +824,6 @@ class DeepseekV41Attention(nn.Module):
             pool_width = max(pool.shape[1] for pool, _ in parts)
             if pool_width:
                 index_width = max(idx.shape[-1] for _, idx in parts)
-                pool = mx.concatenate(
-                    [
-                        mx.pad(
-                            value, [(0, 0), (0, pool_width - value.shape[1]), (0, 0)]
-                        )
-                        for value, _ in parts
-                    ]
-                )
                 indices = mx.concatenate(
                     [
                         mx.pad(
@@ -842,7 +834,28 @@ class DeepseekV41Attention(nn.Module):
                         for _, idx in parts
                     ]
                 )
-                out = self._sparse_attention(q, window, pool, indices, mask)
+                pools = tuple(value for value, _ in parts)
+                out = sparse_attention(
+                    q,
+                    window,
+                    pools,
+                    indices,
+                    mask,
+                    self.attn_sink,
+                    self.scale,
+                    self.window_size,
+                )
+                if out is None:
+                    pool = mx.concatenate(
+                        [
+                            mx.pad(
+                                value,
+                                [(0, 0), (0, pool_width - value.shape[1]), (0, 0)],
+                            )
+                            for value in pools
+                        ]
+                    )
+                    out = self._sparse_attention(q, window, pool, indices, mask)
         if out is None:
             kv = window[:, None].astype(q.dtype)
             out = mx.fast.scaled_dot_product_attention(
