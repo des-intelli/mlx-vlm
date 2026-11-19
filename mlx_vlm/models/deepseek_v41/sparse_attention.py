@@ -371,13 +371,16 @@ def sparse_attention(
     sinks: mx.array,
     scale: float,
     window_size: int,
+    *,
+    group_decode_pools: bool = False,
 ) -> Optional[mx.array]:
     """Return fused attention, or ``None`` for unsupported inputs/devices.
 
     Queries are [B,H,L,D], window/pool are [B,K,D], indices are [B,L,S].
     The window ends at the last query and includes up to ``window_size`` keys
     per query. A tuple of up to eight [1,K_i,D] pools binds each row directly
-    without copying independent request caches into a padded array.
+    without copying independent request caches into a padded array. With
+    group_decode_pools, wider single-token batches use multiple such groups.
     Its boolean mask is [1 or B,1,L,K]; indices of -1 are ignored.
     Scores, the shared softmax (including sinks), and values accumulate in FP32.
     """
@@ -397,7 +400,10 @@ def sparse_attention(
     separate = isinstance(pool, tuple)
     pools = pool if separate else (pool,)
     pool_count = len(pools) if separate else 0
-    if separate and (pool_count != batch or not 1 <= pool_count <= 8):
+    if separate and (
+        pool_count != batch
+        or (pool_count > 8 and not (group_decode_pools and length == 1))
+    ):
         return None
     if (
         min(batch, heads, length, dim, window_size) <= 0
@@ -420,6 +426,24 @@ def sparse_attention(
         or sinks.shape != (heads,)
     ):
         return None
+    if pool_count > 8:
+        # Group only attention. Projections and cache updates keep the full batch.
+        outputs = []
+        for start in range(0, batch, 8):
+            rows = slice(start, start + 8)
+            outputs.append(
+                sparse_attention(
+                    queries[rows],
+                    window[rows],
+                    pools[rows],
+                    indices[rows],
+                    mask if mask.shape[0] == 1 else mask[rows],
+                    sinks,
+                    scale,
+                    window_size,
+                )
+            )
+        return mx.concatenate(outputs, axis=0)
     scale_array, sizes = _scalars(
         float(scale), length, window.shape[1], tuple(p.shape[1] for p in pools)
     )

@@ -4039,6 +4039,63 @@ def test_deepseek_v41_sparse_attention_binds_independent_pool_views(
     assert mx.array_equal(actual, expected).item()
 
 
+@pytest.mark.parametrize("batch", [9, 16, 33])
+@pytest.mark.parametrize("row_mask", [False, True])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_grouped_decode_pools_match_padded(batch, row_mask, dtype):
+    q, window, pool, idx, mask, sinks, scale, size = _deepseek_v41_sparse_inputs(
+        batch, 8, 1, 512, 127, 512, dtype, 128, 71
+    )
+    lengths = [0 if i % 8 == 0 else (3, 17, 65)[i % 3] for i in range(batch)]
+    pools = tuple(pool[i : i + 1, :n] for i, n in enumerate(lengths))
+    idx = mx.where(idx < mx.array(lengths)[:, None, None], idx, -1)
+    if row_mask:
+        mask = mask & (mx.arange(batch)[:, None, None, None] % 3 != 0)
+    padded = mx.concatenate(
+        [
+            mx.pad(p, [(0, 0), (0, max(lengths) - n), (0, 0)])
+            for p, n in zip(pools, lengths)
+        ]
+    )
+    args = (idx, mask, sinks, scale, size)
+    assert deepseek_v41_sparse_attention(q, window, pools, *args) is None
+    expected = deepseek_v41_sparse_attention(q, window, padded, *args)
+    actual = deepseek_v41_sparse_attention(
+        q, window, pools, *args, group_decode_pools=True
+    )
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal required")
+def test_deepseek_v41_grouped_pools_decline_wide_blocks_and_invalid_last_row():
+    q, window, pool, idx, mask, sinks, scale, size = _deepseek_v41_sparse_inputs(
+        9, 8, 6, 512, 127, 512
+    )
+    pools = tuple(pool[i : i + 1] for i in range(9))
+    assert (
+        deepseek_v41_sparse_attention(
+            q, window, pools, idx, mask, sinks, scale, size, group_decode_pools=True
+        )
+        is None
+    )
+    invalid = (*pools[:-1], pools[-1].astype(mx.float32))
+    assert (
+        deepseek_v41_sparse_attention(
+            q[:, :, :1],
+            window,
+            invalid,
+            idx[:, :1],
+            mask[:, :, :1],
+            sinks,
+            scale,
+            size,
+            group_decode_pools=True,
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("batch", [4, 8])
 @pytest.mark.parametrize("masked", [False, True])
