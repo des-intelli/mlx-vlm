@@ -6058,15 +6058,16 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                     inputs.append(ids[:, prefix : prefix + 6])
                 cache = rows[0].merge(rows)
                 generation = cache.start_speculation(6, block=True)
+                layer = model.layers[0].attn
+                method = "_ragged_attention" if layer.ragged_decode else "_attention"
+                calls = 1 if layer.ragged_decode else len(rows)
                 with patch.object(
-                    model.layers[0].attn,
-                    "_attention",
-                    wraps=model.layers[0].attn._attention,
+                    layer, method, wraps=getattr(layer, method)
                 ) as attention:
                     mx.eval(model(mx.concatenate(inputs), cache=[cache]).logits)
-                    self.assertEqual(attention.call_count, 2)
+                    self.assertEqual(attention.call_count, calls)
                     cache.commit_speculation(retained, generation)
-                    self.assertEqual(attention.call_count, 2)
+                    self.assertEqual(attention.call_count, calls)
                 for index, (prefix, keep, reference) in enumerate(
                     zip(prefixes, retained, references)
                 ):
