@@ -25,7 +25,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models as models
 import mlx_vlm.turboquant as tq
@@ -70,7 +70,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
     create_causal_mask,
 )
-from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
+from mlx_vlm.models.deepseek_v41.language import BatchDeepseekV41Cache, DeepseekV41Cache
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxM3BatchKVCache,
@@ -92,6 +92,7 @@ from mlx_vlm.tests.test_models import (
     build_config,
     make_ernie55_model,
     model_case,
+    tiny_config,
     tiny_language_model,
 )
 from mlx_vlm.turboquant import (
@@ -4665,3 +4666,159 @@ def test_ernie55_cache_merge_extract_filter_and_reset():
         atol=2e-5,
         rtol=2e-5,
     )
+
+
+def test_deepseek_v41_append_unequal_chunks_preserves_populated_rows():
+    from mlx_vlm.models import deepseek_v41
+    from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+    from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+    mx.random.seed(19)
+    case = next(case for case in DATA["cases"] if case["module"] == "deepseek_v41")
+    config = build_config(deepseek_v41, case["config"])
+    model = LanguageModel(config)
+    model.engram_hash = NgramHashState(
+        config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
+    )
+    model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
+    references = [model.make_cache(), model.make_cache()]
+    for cache, prompt in zip(references, [[3, 7, 11], [9, 13, 17, 21, 25]]):
+        mx.eval(model(mx.array([prompt]), cache=cache).logits)
+    batch = references[0][0].merge([row[0] for row in references])
+    for chunks in [[[19, 23, 27, 31], [29, 33, 37, 41, 45]], [[47], [51]]]:
+        lengths = [len(tokens) for tokens in chunks]
+        width = batch.prepare_append(lengths)
+        ids = mx.array([[0] * (width - len(tokens)) + tokens for tokens in chunks])
+        actual = model(ids, cache=[batch], logits_to_keep=1).logits
+        expected = mx.concatenate(
+            [
+                model(mx.array([tokens]), cache=cache, logits_to_keep=1).logits
+                for tokens, cache in zip(chunks, references)
+            ]
+        )
+        assert mx.allclose(actual, expected, atol=1e-4).item()
+        for i, reference in enumerate(references):
+            row = batch.extract(i)
+            assert row.offset == reference[0].offset
+            assert mx.array_equal(row.engram, reference[0].engram).item()
+    with pytest.raises(ValueError):
+        batch.prepare_append([0, 1])
+    with pytest.raises(ValueError):
+        batch.prepare_append([1])
+
+
+class _RowDeepseekV41Cache(BatchDeepseekV41Cache):
+    def for_decode(self, width):
+        return self
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_deepseek_v41_aligned_decode_then_filter_join_and_prefill(dtype, monkeypatch):
+    from mlx_vlm.models.deepseek_v41 import fakequant
+    from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+    from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+    # Isolate cache transitions from FP32 matmul changes crossing QAT rounding
+    # thresholds. The BF16 case exercises the model's real fake quantization.
+    monkeypatch.setattr(fakequant, "DISABLE", dtype == mx.float32)
+    mx.random.seed(31)
+    config = tiny_config("deepseek_v41")
+    model = LanguageModel(config)
+    model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
+    model.update(tree_map(lambda p: p.astype(dtype), model.parameters()))
+    model.head.weight = model.head.weight.astype(mx.float32)
+    model.engram_hash = NgramHashState(
+        config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
+    )
+    fast = BatchDeepseekV41Cache(
+        [DeepseekV41Cache(len(model.layers)) for _ in range(4)]
+    )
+    slow = _RowDeepseekV41Cache([DeepseekV41Cache(len(model.layers)) for _ in range(4)])
+
+    def compare(tokens):
+        tokens = tokens % config.vocab_size
+        a = model(tokens, cache=[fast]).logits
+        b = model(tokens, cache=[slow]).logits
+        mx.eval(a, b, fast.state, slow.state)
+        assert mx.allclose(
+            a,
+            b,
+            atol=0.02 if dtype == mx.bfloat16 else 1e-4,
+            rtol=0.02 if dtype == mx.bfloat16 else 1e-4,
+        ).item()
+        assert fast.offset.tolist() == slow.offset.tolist()
+        assert fast.size() == slow.size()
+        for i in range(tokens.shape[0]):
+            assert mx.array_equal(fast.extract(i).engram, slow.extract(i).engram).item()
+
+    compare(mx.array([[3 + row, 7, 9, 11, 13, 15, 17] for row in range(4)]))
+    assert fast._batched is None
+    native = None
+    for step in range(9):
+        compare(mx.array([[19 + row + step] for row in range(4)]))
+        native = native or fast._batched
+        assert fast._batched is native
+        assert fast.memory_profile(fast.size()).source_bytes > 0
+    snapshot = fast.extract(2)
+    saved = [mx.array(a) for a in snapshot.state]
+    fast.filter([2, 0])
+    slow.filter([2, 0])
+    assert fast._batched is None
+    compare(mx.array([[41], [43]]))
+    assert fast._batched is not None
+    for a, b in zip(saved, snapshot.state):
+        assert mx.array_equal(a, b).item()
+
+    # A joining request with a different compression phase must remain ragged.
+    joined = model.make_cache()
+    mx.eval(model(mx.array([[11, 13, 15]]), cache=joined).logits)
+    fast.extend(BatchDeepseekV41Cache([joined[0].extract(0)]))
+    slow.extend(_RowDeepseekV41Cache([joined[0].extract(0)]))
+    compare(mx.array([[45], [47], [49]]))
+    assert fast._batched is None
+    fast.filter([1, 0])
+    slow.filter([1, 0])
+    compare(mx.array([[51], [53]]))
+    assert fast._batched is not None
+    # A chunk after decode unpacks current buffers before entering the row path.
+    compare(mx.array([[55, 57], [59, 61]]))
+    assert fast._batched is None
+    compare(mx.array([[63], [65]]))
+    assert fast._batched is not None
+
+
+def test_deepseek_v41_decode_pack_preserves_snapshot_layout_and_is_conservative():
+    def make():
+        rows = [DeepseekV41Cache(2) for _ in range(2)]
+        for i, row in enumerate(rows):
+            row.offset = 7
+            row.window[0] = mx.full((1, 4, 32), float(i))
+            row.compress[1] = mx.full((1, 3, 32), float(i + 2))
+            row.compress_kv = row.compress[1]
+            row.engram = mx.full((1, 7), i, mx.int64)
+        return BatchDeepseekV41Cache(rows)
+
+    cache = make()
+    before = cache.state
+    packed = cache.for_decode(1)
+    assert isinstance(packed, DeepseekV41Cache)
+    assert cache.for_decode(1) is packed
+    for original, snapshot in zip(before, cache.state):
+        for a, b in zip(original, snapshot):
+            assert mx.array_equal(a, b).item()
+    assert cache._batched is packed
+    assert cache.rows[1].offset == 7
+    assert cache._batched is None
+
+    for change in (
+        lambda c: c.left_padding.__setitem__(0, 1),
+        lambda c: c._lengths.__setitem__(0, 1),
+        lambda c: setattr(c.rows[1], "offset", 8),
+        lambda c: c.rows[1].window.__setitem__(0, None),
+        lambda c: c.rows[1].window.__setitem__(0, mx.zeros((1, 5, 32))),
+        lambda c: c.rows[1].window.__setitem__(0, mx.zeros((1, 4, 32), mx.bfloat16)),
+    ):
+        cache = make()
+        change(cache)
+        assert cache.for_decode(1) is cache
+        assert cache._batched is None

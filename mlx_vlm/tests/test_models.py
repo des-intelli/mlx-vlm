@@ -39,6 +39,7 @@ from mlx_vlm import embedding_loader
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
 from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_vlm.models.deepseek_v41 import language as deepseek_v41_language
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
@@ -3319,7 +3320,23 @@ def _prepare_ernie_distributed(model, dtype):
                 ).astype(dtype)
 
 
+def _prepare_deepseek_v41_distributed(model, dtype):
+    from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+
+    # Keep nonuniform vocabulary weights small and preserve the FP32 head.
+    model.head.weight = (
+        (mx.random.normal(model.head.weight.shape) * 0.05)
+        .astype(dtype)
+        .astype(mx.float32)
+    )
+    config = model.config
+    model.engram_hash = NgramHashState(
+        config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
+    )
+
+
 DISTRIBUTED_MODEL_SETUPS = {
+    "deepseek_v41": _prepare_deepseek_v41_distributed,
     "minimax_m3_nvfp4": _prepare_minimax_distributed,
     "ernie5_5_moe": _prepare_ernie_distributed,
     "inkling2": _prepare_inkling2_distributed,
@@ -5938,6 +5955,28 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 for check in checks:
                     self.assertTrue(check.item())
 
+    def test_selected_logits_preserve_chunked_cache_and_decode(self):
+        config = tiny_config("deepseek_v41")
+        model = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        ids = mx.array([[3, 7, 11, 15, 19, 23, 27, 31]])
+        full_cache, selected_cache = model.make_cache(), model.make_cache()
+        reference = model(ids[:, :4], cache=full_cache).logits
+        mx.eval(reference)
+        empty = model(ids[:, :4], cache=selected_cache, logits_to_keep=0).logits
+        self.assertEqual(empty.shape, (1, 0, config.vocab_size))
+        expected = model(ids[:, 4:], cache=full_cache).logits[:, -1:]
+        actual = model(ids[:, 4:], cache=selected_cache, logits_to_keep=1).logits
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+        for left, right in zip(full_cache[0].state, selected_cache[0].state):
+            self.assertTrue(mx.array_equal(left, right).item())
+        next_id = mx.argmax(expected[:, -1], axis=-1)[:, None]
+        expected = model(next_id, cache=full_cache).logits
+        actual = model(next_id, cache=selected_cache, logits_to_keep=1).logits
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+        with self.assertRaises(ValueError):
+            model(ids, logits_to_keep=-1)
+
 
 class TestMoERouterStopGradient:
     def test_gather_indices_are_stop_gradiented(self):
@@ -8083,3 +8122,46 @@ def test_ernie55_fp8_tail_blocks_use_shared_decoder():
         out["language_model.model.layers.0.attn.wq_a.weight"].astype(mx.float32),
         expected,
     )
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
+def test_load_model_uses_language_model_fp8_quantization_config(model_type):
+    module = importlib.import_module(f"mlx_vlm.models.{model_type}")
+    case = next(c for c in DATA["cases"] if c["module"] == model_type)
+    language_model = module.Model(build_config(module, case["config"])).language_model
+
+    quantization = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.weight": {"group_size": 64, "bits": 8, "mode": "affine"},
+    }
+    with (
+        patch(
+            f"mlx_vlm.models.{model_type}.language.make_quantization_config",
+            return_value=quantization,
+        ) as make_quantization_config,
+        _checkpoint_loading(
+            {
+                "model_type": model_type,
+                "quantization_config": {"quant_method": "fp8"},
+            },
+            lambda config: _CheckpointModel(config, language_model=language_model),
+            {},
+        ) as quantize,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+    make_quantization_config.assert_called_once_with(model)
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 64
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_deepseek_v41_invalid_shard_preserves_parameters():
+    model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))
+    before = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Expert count"):
+        model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
+    after = dict(tree_flatten(model.parameters()))
+    assert all(after[k] is v for k, v in before.items())

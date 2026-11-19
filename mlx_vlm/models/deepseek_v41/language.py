@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.nn.layers.distributed import shard_inplace
 
 from ..base import LanguageModelOutput
 from ..cache import CacheMemory, KVCache, cache_nbytes
@@ -14,11 +15,36 @@ from ..deepseek_v4.language import (
     DeepseekV4RoPE,
     _sparse_pooled_attention,
 )
+from ..deepseek_v4.language import make_quantization_config as _v4_quantization_config
 from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .engram import Engram, EngramLayout, NgramHashState
-from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
+from .fakequant import (
+    fake_quant_fp4_e4m3,
+    fake_quant_fp4_ue8m0,
+    fake_quant_fp8_ue8m0,
+    weighted_swiglu_fp8,
+)
+from .sparse_attention import sparse_attention
+
+
+def make_quantization_config(model):
+    """Native V4 expert/attention formats, plus V4.1's FP8 Engram projection."""
+    # The released V4.1 vision tower is BF16, including its attention weights.
+    quantization = {
+        path: params
+        for path, params in _v4_quantization_config(model).items()
+        if not isinstance(params, dict) or path.startswith("language_model.")
+    }
+    for i, layer in enumerate(model.language_model.layers):
+        if layer.engram is not None:
+            quantization[f"language_model.layers.{i}.engram.wkv"] = {
+                "group_size": 32,
+                "bits": 8,
+                "mode": "mxfp8",
+            }
+    return quantization
 
 
 def _index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
@@ -416,6 +442,9 @@ class DeepseekV41SwiGLU(nn.Module):
         self.limit = limit
 
     def __call__(self, up, gate, weights):
+        fused = weighted_swiglu_fp8(up, gate, weights, self.limit)
+        if fused is not None:
+            return fused
         activated = _swiglu(gate, up, self.limit)
         # Weight before the BF16 cast and FP8 rounding of the down-projection input.
         return fake_quant_fp8_ue8m0((activated * weights).astype(up.dtype))
@@ -438,6 +467,17 @@ class DeepseekV41SwitchGLU(SwitchGLU):
         if do_sort:
             y = mx.unflatten(y[mx.argsort(order)], 0, shape)
         return y.squeeze(-2)
+
+
+@mx.compile
+def _local_expert_routes(inds, scores, start, count):
+    local = (inds >= start) & (inds < start + count)
+    return local, mx.where(local, inds - start, 0), mx.where(local, scores, 0)
+
+
+@mx.compile
+def _combine_local_experts(values, local):
+    return mx.where(local[..., None], values.astype(mx.float32), 0).sum(axis=-2)
 
 
 class DeepseekV41MoE(nn.Module):
@@ -471,22 +511,71 @@ class DeepseekV41MoE(nn.Module):
             intermediate_size=inter,
             swiglu_limit=config.swiglu_limit,
         )
+        self.sharding_group = None
+
+    def _distributed_decode_experts(self, x, inds, scores):
+        """Keep small decode dispatch on-device with zero-weight non-local routes.
+
+        Non-local routes reuse local expert zero with zero weight, avoiding a
+        route sort, scatter buffer, or variable-sized dispatch with CPU readback.
+        Weighting still precedes the BF16/FP8 down-projection rounding.
+        """
+        group = self.sharding_group
+        count = self.switch_mlp.gate_proj.weight.shape[0]
+        start = group.rank() * count
+        local, local_inds, local_scores = _local_expert_routes(
+            inds, scores, start, count
+        )
+        values = self.switch_mlp(x, local_inds, local_scores)
+        routed = _combine_local_experts(values, local)
+        return mx.distributed.all_sum(routed, group=group)
+
+    def _distributed_experts(self, x, inds, scores):
+        """Evaluate only routes owned by this rank, then combine token outputs."""
+        if x.shape[1] == 1 and inds.size <= 128:
+            return self._distributed_decode_experts(x, inds, scores)
+        group = self.sharding_group
+        count = self.switch_mlp.gate_proj.weight.shape[0]
+        start, stop = group.rank() * count, (group.rank() + 1) * count
+        flat = inds.flatten()
+        order = mx.argsort(flat)
+        # The variable number of local routes needs one small host sync.
+        first, last = mx.stack([(flat < start).sum(), (flat < stop).sum()]).tolist()
+        routed = mx.zeros((flat.size, x.shape[-1]), dtype=mx.float32)
+        if last > first:
+            positions = order[first:last]
+            local_x = x.reshape(-1, x.shape[-1])[positions // inds.shape[-1]]
+            local_inds = (flat[positions] - start)[:, None]
+            local_scores = scores.flatten()[positions, None]
+            values = self.switch_mlp(local_x, local_inds, local_scores)[:, 0]
+            routed = routed.at[positions].add(values.astype(mx.float32))
+        routed = routed.reshape(*inds.shape, x.shape[-1]).sum(-2)
+        return mx.distributed.all_sum(routed, group=group)
 
     def __call__(self, x: mx.array, image_mask: Optional[mx.array] = None) -> mx.array:
         inds, scores = self.gate(x, image_mask)
-        y = self.switch_mlp(fake_quant_fp8_ue8m0(x), inds, scores)
-        y = y.astype(mx.float32).sum(-2)
+        rounded = fake_quant_fp8_ue8m0(x)
+        if self.sharding_group is None:
+            y = self.switch_mlp(rounded, inds, scores).astype(mx.float32).sum(-2)
+        else:
+            y = self._distributed_experts(rounded, inds, scores)
         return (y + self.shared_experts(x).astype(mx.float32)).astype(x.dtype)
 
 
 def _apply_rope_at_positions(
-    x: mx.array, positions: mx.array, rope_dim: int, theta: float, yarn: tuple
+    x: mx.array,
+    positions: mx.array,
+    rope_dim: int,
+    theta: float,
+    yarn: tuple,
+    table_len: Optional[int] = None,
 ) -> mx.array:
     """Rotate strided positions (compressor latents) with explicit tables.
 
     Paired as ``mx.fast.rope(traditional=True)`` pairs, to match the queries.
     """
-    table_len = int(mx.max(positions).item()) + 1 if positions.size else 1
+    if table_len is None:
+        table_len = int(mx.max(positions).item()) + 1 if positions.size else 1
     cos, sin = _index_cos_sin(table_len, rope_dim, theta, yarn)
     shape = (1,) * (x.ndim - positions.ndim - 1) + positions.shape + (cos.shape[-1],)
     cos_rows = cos[positions].reshape(shape)
@@ -617,6 +706,7 @@ class DeepseekV41Attention(nn.Module):
                     self.config.qk_rope_head_dim,
                     self._latent_theta,
                     self._latent_yarn,
+                    table_len=start_pos + seqlen,
                 )
                 pool_kv = fake_quant_fp4_e4m3(pool_kv)
                 cache.append_compressed(self.layer_idx, pool_kv)
@@ -642,8 +732,20 @@ class DeepseekV41Attention(nn.Module):
         return mx.zeros_like(x) if out is None else out
 
     def _sparse_attention(self, q, window, pool, indices, window_mask):
+        out = sparse_attention(
+            q,
+            window,
+            pool,
+            indices,
+            window_mask,
+            self.attn_sink,
+            self.scale,
+            self.window_size,
+        )
+        if out is not None:
+            return out
         # Keep KV storage in the model dtype, but scores and softmax in FP32.
-        # MLX's fused BF16 attention does not cover the model's 512-wide heads.
+        # Reference path for devices, dtypes, and layouts unsupported by Metal.
         return _sparse_pooled_attention(
             q.astype(mx.float32),
             window[:, None],
@@ -938,16 +1040,23 @@ class DeepseekV41Block(nn.Module):
 
 
 class ParallelHead(nn.Module):
-    """Vocabulary projection kept in fp32 so logits come out fp32 directly."""
+    """FP32 vocabulary projection, optionally partitioned across ranks."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.weight = mx.zeros(
             (config.vocab_size, config.hidden_size), dtype=mx.float32
         )
+        self.sharding_group = None
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x.astype(mx.float32) @ self.weight.T
+        logits = x.astype(mx.float32) @ self.weight.T
+        if self.sharding_group is not None:
+            logits = mx.distributed.all_gather(
+                mx.moveaxis(logits, -1, 0), group=self.sharding_group
+            )
+            logits = mx.moveaxis(logits, 0, -1)
+        return logits
 
 
 class DeepseekV41Cache:
@@ -1183,9 +1292,9 @@ class DeepseekV41Cache:
 class BatchDeepseekV41Cache:
     """Keep each request's compression phase and Engram history independent.
 
-    Attention visits the unpadded rows; token-wise layers, including the experts,
-    still run together. This also lets requests join at different offsets without
-    padding or shifting their partially filled compression groups.
+    Prefill and ragged requests visit unpadded rows. Aligned decode keeps one
+    native batched cache until a batch mutation or an incompatible call requires
+    splitting it. Compression phases and Engram histories remain per request.
     """
 
     def __init__(self, rows, left_padding=None):
@@ -1196,7 +1305,62 @@ class BatchDeepseekV41Cache:
         self._lengths = [None] * len(rows)
 
     @property
+    def rows(self):
+        self._unpack()
+        return self._rows
+
+    def _unpack(self):
+        # Materialize row views only for callers that need individual caches.
+        if self._batched is not None:
+            self._rows = [self._batched.extract(i) for i in range(self._batch_size)]
+            self._batched = None
+
+    @rows.setter
+    def rows(self, rows):
+        self._rows = rows
+        self._batch_size = len(rows)
+        self._batched = None
+
+    def for_decode(self, width):
+        """Pack compatible one-token requests once; retain the packed state."""
+        if (
+            width != 1
+            or self.is_speculating
+            or self._batch_size < 2
+            or any(self.left_padding)
+            or any(length is not None for length in self._lengths)
+        ):
+            # A subsequent prefill/partial-row call must see up-to-date rows.
+            self._unpack()
+            return self
+        if self._batched is not None:
+            return self._batched
+        first = self._rows[0]
+        if first.offset == 0 or any(
+            row.offset != first.offset or row.n_layers != first.n_layers
+            for row in self._rows[1:]
+        ):
+            return self
+        states = [row.state for row in self._rows]
+        columns = list(zip(*states))
+        if any(
+            array.shape != column[0].shape or array.dtype != column[0].dtype
+            for column in columns
+            for array in column[1:]
+        ) or any(array.size and array.shape[0] != 1 for array in states[0]):
+            return self
+        state = [
+            mx.concatenate(column, axis=0) if column[0].size else column[0]
+            for column in columns
+        ]
+        self._batched = DeepseekV41Cache.from_state(state, first.meta_state)
+        self._rows = []
+        return self._batched
+
+    @property
     def offset(self):
+        if self._batched is not None:
+            return mx.full((self._batch_size,), self._batched.offset, mx.int32)
         return mx.array([row.offset for row in self.rows])
 
     def _bounds(self, index, width):
@@ -1308,8 +1472,23 @@ class BatchDeepseekV41Cache:
         if right_padding is not None:
             self._lengths = list(lengths)
 
+    def prepare_append(self, lengths):
+        """Append unequal token chunks to populated rows using left padding.
+
+        Attention, compression, and Engram visit each row's valid tokens only.
+        Dense projections and experts can share the padded model batch.
+        """
+        if len(lengths) != self._batch_size or any(length < 1 for length in lengths):
+            raise ValueError("Append lengths must be positive and match the batch")
+        if any(self.left_padding) or any(x is not None for x in self._lengths):
+            raise ValueError("Finish pending padding before appending new chunks")
+        self._unpack()
+        width = max(lengths)
+        self.left_padding = [width - length for length in lengths]
+        return width
+
     def finalize(self):
-        self._lengths = [None] * len(self.rows)
+        self._lengths = [None] * self._batch_size
 
     def filter(self, indices):
         indices = indices.tolist() if isinstance(indices, mx.array) else indices
@@ -1319,17 +1498,29 @@ class BatchDeepseekV41Cache:
 
     def extend(self, other):
         self.rows.extend(other.rows)
+        self._batch_size = len(self.rows)
         self.left_padding.extend(other.left_padding)
         self._lengths.extend(other._lengths)
 
     def extract(self, index):
+        if self._batched is not None:
+            return self._batched.extract(index)
         return self.rows[index].extract(0)
 
     @property
     def state(self):
+        if self._batched is not None:
+            # Preserve the public per-row snapshot layout without unpacking.
+            state = self._batched.state
+            return [
+                [array[i : i + 1] if array.size else array for array in state]
+                for i in range(self._batch_size)
+            ]
         return [row.state for row in self.rows]
 
     def memory_profile(self, token_count):
+        if self._batched is not None:
+            return self._batched.memory_profile(token_count)
         profiles = [row.memory_profile(token_count) for row in self.rows]
         return CacheMemory(
             source_bytes=sum(profile.source_bytes for profile in profiles),
@@ -1341,6 +1532,8 @@ class BatchDeepseekV41Cache:
         return False
 
     def size(self):
+        if self._batched is not None:
+            return self._batched.offset
         return max((row.offset for row in self.rows), default=0)
 
 
@@ -1363,6 +1556,33 @@ class LanguageModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.head = ParallelHead(config)
+
+    def shard(self, group=None):
+        """Partition routed experts and the FP32 vocabulary projection.
+
+        Each expert retains complete projections and their rounding boundaries.
+        FP32 expert sums are reduced and vocabulary logits gathered between hosts.
+        """
+        group = group or mx.distributed.init()
+        size = group.size()
+        if size == 1:
+            return
+        if getattr(self, "_sharding_group", None) is not None:
+            raise ValueError("The language model is already sharded")
+        for layer in self.layers:
+            count = layer.ffn.switch_mlp.gate_proj.weight.shape[0]
+            if count % size:
+                raise ValueError(f"Expert count ({count}) must be divisible by {size}")
+        for layer in self.layers:
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                shard_inplace(
+                    getattr(layer.ffn.switch_mlp, name), lambda p, w: 0, group=group
+                )
+            layer.ffn.sharding_group = group
+        if self.head.weight.shape[0] % size == 0:
+            shard_inplace(self.head, lambda p, w: 0, group=group)
+            self.head.sharding_group = group
+        self._sharding_group = group
 
     def _ensure_engram_hash(self):
         """Build the n-gram hash state on first use from the checkpoint directory.
@@ -1413,6 +1633,7 @@ class LanguageModel(nn.Module):
         engram_hashes: Optional[mx.array] = None,
         inputs: Optional[mx.array] = None,
         n_to_process: Optional[int] = None,
+        logits_to_keep: Optional[int] = None,
         **kwargs,
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
@@ -1423,6 +1644,8 @@ class LanguageModel(nn.Module):
         and a chunked prompt encodes differently from an unchunked one.
         `n_to_process` is implied by the slice and is not needed.
         """
+        if logits_to_keep is not None and logits_to_keep < 0:
+            raise ValueError("logits_to_keep must be nonnegative or None")
         entry = cache[0] if cache else DeepseekV41Cache(len(self.layers))
         if input_ids is None:
             input_ids = inputs
@@ -1473,6 +1696,8 @@ class LanguageModel(nn.Module):
         else:
             h = inputs_embeds
         batch, seqlen = h.shape[0], h.shape[1]
+        if isinstance(entry, BatchDeepseekV41Cache):
+            entry = entry.for_decode(seqlen)
         h = mx.broadcast_to(
             h[..., None, :],
             (batch, seqlen, self.config.hc_mult, self.config.hidden_size),
@@ -1500,7 +1725,16 @@ class LanguageModel(nn.Module):
             if capture is not None and index in capture:
                 hidden.append(h.mean(axis=2))
             h, pre_mix = layer(h, pre_mix, image_mask, entry)
-        h = DeepseekV41Block.hc_pre(h, pre_mix)
-        logits = self.head(self.norm(h))
         entry.advance(seqlen)
+        if logits_to_keep == 0:
+            # A prefill-only step still executes the final layer's collectives
+            # and materializes all recurrent state before the next chunk.
+            mx.eval(h, entry.state)
+            logits = mx.zeros((batch, 0, self.config.vocab_size), mx.float32)
+        else:
+            if logits_to_keep is not None:
+                h = h[:, -logits_to_keep:]
+                pre_mix = pre_mix[:, -logits_to_keep:]
+            h = DeepseekV41Block.hc_pre(h, pre_mix)
+            logits = self.head(self.norm(h))
         return LanguageModelOutput(logits=logits, hidden_states=hidden)
