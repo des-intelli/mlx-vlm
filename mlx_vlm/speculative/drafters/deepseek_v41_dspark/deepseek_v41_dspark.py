@@ -1,4 +1,5 @@
 import re
+from collections import defaultdict
 from dataclasses import replace
 
 import mlx.core as mx
@@ -16,27 +17,66 @@ from ....models.deepseek_v41.language import (
 from ..deepseek_v4_dspark.deepseek_v4_dspark import DeepseekV4DsparkDraftModel
 
 
+def _context_position(cache):
+    return cache.offset + getattr(cache, "dspark_start_position", 0)
+
+
+class _DraftCacheRows:
+    """Expose independent rotating histories to a batched draft stage."""
+
+    def __init__(self, rows, counts):
+        self.rows = rows
+        self.counts = counts
+        self.offset = mx.array([_context_position(row) for row in rows], mx.int32)
+
+    def append(self, keys, window, width):
+        histories = []
+        for i, (row, count) in enumerate(zip(self.rows, self.counts, strict=True)):
+            k = keys[i : i + 1, :, :count]
+            history, _ = row.update_and_fetch(k, mx.zeros((*k.shape[:-1], 0)))
+            histories.append(history[:, :, -window:])
+        lengths = [k.shape[2] for k in histories]
+        longest = max(lengths)
+        if min(lengths) == longest:
+            return mx.concatenate(histories), None
+        # Padding is visible to neither SDPA nor the request-owned rotating cache.
+        mask = mx.arange(longest + width) >= (longest - mx.array(lengths))[:, None]
+        keys = mx.concatenate(
+            [
+                mx.pad(k, [(0, 0), (0, 0), (longest - n, 0), (0, 0)])
+                for k, n in zip(histories, lengths)
+            ]
+        )
+        return keys, mask[:, None, None]
+
+
 class DSparkAttention(DeepseekV41Attention):
     def __call__(self, x, context, cache):
         batch, length, _ = x.shape
         count = context.shape[1]
-        offset = cache.offset
+        offset = _context_position(cache)
         kv = self.kv_norm(self.wkv(fake_quant_fp8_ue8m0(context)))[:, None]
         kv = fake_quant_fp8_ue8m0(self.rope(kv, offset))
-        kv, _ = cache.update_and_fetch(kv, mx.zeros((*kv.shape[:-1], 0)))
-        kv = kv[..., -self.window_size :, :]
+        if isinstance(cache, _DraftCacheRows):
+            kv, mask = cache.append(kv, self.window_size, length)
+            position = offset + mx.array(cache.counts, mx.int32)
+        else:
+            kv, _ = cache.update_and_fetch(kv, mx.zeros((*kv.shape[:-1], 0)))
+            kv = kv[..., -self.window_size :, :]
+            mask = None
+            position = offset + count
         q = self.wq_b(
             fake_quant_fp8_ue8m0(self.q_norm(self.wq_a(fake_quant_fp8_ue8m0(x))))
         )
         q = q.reshape(batch, length, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q = self.rope(q, offset + count)
+        q = self.rope(q, position)
         block_kv = self.kv_norm(self.wkv(fake_quant_fp8_ue8m0(x)))[:, None]
-        block_kv = fake_quant_fp8_ue8m0(self.rope(block_kv, offset + count))
+        block_kv = fake_quant_fp8_ue8m0(self.rope(block_kv, position))
         kv = mx.concatenate([kv, block_kv], axis=2)
         out = mx.fast.scaled_dot_product_attention(
-            q, kv, kv, scale=self.scale, sinks=self.attn_sink.astype(q.dtype)
+            q, kv, kv, scale=self.scale, mask=mask, sinks=self.attn_sink.astype(q.dtype)
         )
-        out = self.rope(out, offset + count, inverse=True)
+        out = self.rope(out, position, inverse=True)
         out = out.reshape(batch, self.o_groups, -1, length, self.head_dim)
         out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
         out = self.wo_a(fake_quant_fp8_ue8m0(out))
@@ -92,6 +132,12 @@ class DeepseekV41DsparkDraftModel(DeepseekV4DsparkDraftModel):
         self._lm_head_fn = target.head
         return self
 
+    def make_cache(self, *, start_position=0):
+        caches = super().make_cache()
+        for cache in caches:
+            cache.dspark_start_position = start_position
+        return caches
+
     def _hidden(self, inputs, target_hidden, cache):
         first = self.stages[0]
         context = first.main_norm(first.main_proj(fake_quant_fp8_ue8m0(target_hidden)))
@@ -101,6 +147,61 @@ class DeepseekV41DsparkDraftModel(DeepseekV4DsparkDraftModel):
         for stage, layer_cache in zip(self.stages, cache):
             h, pre_mix = stage(h, pre_mix, context, layer_cache)
         return self.stages[-1].norm(DeepseekV41Block.hc_pre(h, pre_mix))
+
+    def draft_batch_greedy(
+        self, anchors, hidden, caches, block_size, sampler, token_dtype=mx.int32
+    ):
+        if (
+            len(anchors) == 0
+            or len(anchors) != len(hidden)
+            or len(hidden) != len(caches)
+        ):
+            raise ValueError(
+                "Expected an anchor, target context and cache for each draft row"
+            )
+        if any(h.ndim != 3 or h.shape[0] != 1 or h.shape[1] == 0 for h in hidden):
+            raise ValueError("Expected a nonempty target context per draft row")
+        if any(len(row) != len(self.stages) for row in caches):
+            raise ValueError("Expected one draft cache per stage")
+        # Keep a long newly prefilled prompt from padding every short decode row.
+        buckets = defaultdict(list)
+        for i, h in enumerate(hidden):
+            buckets[max(self.args.sliding_window, h.shape[1]).bit_length()].append(i)
+        if len(buckets) > 1:
+            proposals = [None] * len(hidden)
+            for group in buckets.values():
+                tokens = self.draft_batch_greedy(
+                    [anchors[i] for i in group],
+                    [hidden[i] for i in group],
+                    [caches[i] for i in group],
+                    block_size,
+                    sampler,
+                    token_dtype,
+                )
+                for row, idx in enumerate(group):
+                    proposals[idx] = tokens[row : row + 1]
+            return mx.concatenate(proposals)
+        anchors = mx.array(anchors, dtype=token_dtype)
+        if len(hidden) == 1:
+            return self.draft_block(
+                anchors, hidden[0], caches[0], block_size, sampler, token_dtype
+            )
+        counts = [h.shape[1] for h in hidden]
+        longest = max(counts)
+        context = mx.concatenate(
+            [
+                (
+                    mx.pad(h, [(0, 0), (0, longest - count), (0, 0)])
+                    if count != longest
+                    else h
+                )
+                for h, count in zip(hidden, counts, strict=True)
+            ]
+        )
+        entries = [_DraftCacheRows(rows, counts) for rows in zip(*caches, strict=True)]
+        return self.draft_block(
+            anchors, context, entries, block_size, sampler, token_dtype
+        )
 
     def sanitize(self, weights):
         weights = dict(weights)
