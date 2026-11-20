@@ -484,6 +484,11 @@ def _combine_local_experts(values, local):
     return mx.where(local[..., None], values.astype(mx.float32), 0).sum(axis=-2)
 
 
+@lru_cache(maxsize=1)
+def _native_experts_enabled():
+    return os.environ.get("MLX_VLM_V41_NATIVE_FP4_EXPERTS", "0") == "1"
+
+
 class DeepseekV41MoE(nn.Module):
     """Top-k routed experts plus one shared expert every token goes through."""
 
@@ -536,6 +541,21 @@ class DeepseekV41MoE(nn.Module):
 
     def _distributed_experts(self, x, inds, scores, *, block_verify=False):
         """Evaluate only routes owned by this rank, then combine token outputs."""
+        if (
+            (x.shape[1] == 1 or block_verify)
+            and inds.size <= 128
+            and _native_experts_enabled()
+            and not self.training
+        ):
+            from .native_experts import local_experts
+
+            group = self.sharding_group
+            count = self.switch_mlp.gate_proj.weight.shape[0]
+            output = local_experts(
+                self.switch_mlp, x, inds, scores, group.rank() * count
+            )
+            if output is not None:
+                return mx.distributed.all_sum(output, group=group)
         if (x.shape[1] == 1 or block_verify) and inds.size <= 128:
             return self._distributed_decode_experts(x, inds, scores)
         group = self.sharding_group
