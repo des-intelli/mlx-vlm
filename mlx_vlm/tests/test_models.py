@@ -5332,6 +5332,86 @@ class TestQwen3_5MoeText(unittest.TestCase):
 
 
 class TestDeepseekV41EndToEnd(unittest.TestCase):
+    def test_batched_dspark_preserves_independent_draft_histories(self):
+        from mlx_vlm.speculative.drafters.deepseek_v41_dspark import Model as DraftModel
+        from mlx_vlm.speculative.drafters.deepseek_v41_dspark import (
+            ModelConfig as DraftConfig,
+        )
+
+        mx.random.seed(117)
+        config = tiny_config("deepseek_v41", sliding_window=4)
+        target = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(target, mx.float32)
+        draft = DraftModel(
+            DraftConfig(
+                text_config=config,
+                n_mtp_layers=2,
+                target_layer_ids=[0, 1],
+                mask_token_id=1,
+                markov_rank=8,
+                block_size=6,
+            )
+        ).bind(target)
+        serial = [draft.make_cache() for _ in range(5)]
+        batch = [draft.make_cache() for _ in range(5)]
+        history = [[] for _ in range(5)]
+        # Exercise initial prefill, wrapped rings, survivors, a new row and a singleton.
+        for keys, counts, width in (
+            ([0, 1, 2, 3], [1, 8, 3, 7], 5),
+            ([3, 0, 2], [2, 1, 4], 2),
+            ([2, 0], [1, 2], 1),
+            ([4, 0, 3], [2, 2, 1], 5),
+            ([0], [3], 2),
+        ):
+            hidden = [mx.random.normal((1, n, 2 * config.hidden_size)) for n in counts]
+            for k, h in zip(keys, hidden):
+                history[k].append(h)
+            anchors = [k + 3 for k in keys]
+
+            def greedy(logits):
+                return mx.argmax(logits, axis=-1)
+
+            expected = mx.concatenate(
+                [
+                    draft.draft_block(a, h, serial[k], width + 1, greedy)
+                    for a, h, k in zip(anchors, hidden, keys)
+                ]
+            )
+            actual = draft.draft_batch_greedy(
+                anchors, hidden, [batch[k] for k in keys], width + 1, greedy
+            )
+            self.assertTrue(mx.array_equal(actual, expected).item())
+            for k in keys:
+                for a, b in zip(batch[k], serial[k]):
+                    self.assertEqual(a.offset, b.offset)
+                    self.assertEqual(a._idx, b._idx)
+                    self.assertTrue(
+                        mx.allclose(a.keys, b.keys, atol=1e-5, rtol=1e-5).item()
+                    )
+        # Rebuild a deferred request from its recent committed context at the
+        # actual position, then continue alongside a different request.
+        tails, resumed, expected = [], [], []
+        for k in (0, 3):
+            prefix = mx.concatenate(history[k], axis=1)
+            h = mx.random.normal((1, 1, 2 * config.hidden_size))
+            context = mx.concatenate([prefix, h], axis=1)
+            tails.append(context[:, -config.sliding_window :])
+            resumed.append(
+                draft.make_cache(start_position=context.shape[1] - tails[-1].shape[1])
+            )
+            expected.append(draft.draft_block(4, h, serial[k], 6, greedy))
+        got = draft.draft_batch_greedy([4, 4], tails, resumed, 6, greedy)
+        self.assertTrue(mx.array_equal(got, mx.concatenate(expected)).item())
+        for k, row in zip((0, 3), resumed):
+            for rebuilt, ref in zip(row, serial[k]):
+                self.assertEqual(
+                    rebuilt.dspark_start_position + rebuilt.offset, ref.offset
+                )
+                keys = ref._temporal_order(ref.keys)[:, :, -config.sliding_window :]
+                self.assertTrue(
+                    mx.allclose(keys, rebuilt.keys, atol=1e-5, rtol=1e-5).item()
+                )
+
     def setUp(self):
         mx.random.seed(0)
 
@@ -6092,15 +6172,16 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                     inputs.append(ids[:, prefix : prefix + 6])
                 cache = rows[0].merge(rows)
                 generation = cache.start_speculation(6, block=True)
+                layer = model.layers[0].attn
+                method = "_ragged_attention" if layer.ragged_decode else "_attention"
+                calls = 1 if layer.ragged_decode else len(rows)
                 with patch.object(
-                    model.layers[0].attn,
-                    "_attention",
-                    wraps=model.layers[0].attn._attention,
+                    layer, method, wraps=getattr(layer, method)
                 ) as attention:
                     mx.eval(model(mx.concatenate(inputs), cache=[cache]).logits)
-                    self.assertEqual(attention.call_count, 2)
+                    self.assertEqual(attention.call_count, calls)
                     cache.commit_speculation(retained, generation)
-                    self.assertEqual(attention.call_count, 2)
+                    self.assertEqual(attention.call_count, calls)
                 for index, (prefix, keep, reference) in enumerate(
                     zip(prefixes, retained, references)
                 ):
@@ -6114,6 +6195,63 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                     self.assertTrue(
                         mx.allclose(actual, expected, atol=1e-4, rtol=1e-4).item()
                     )
+
+    def test_ragged_attention_batches_ring_updates_and_partial_commits(self):
+        config = tiny_config(
+            "deepseek_v41",
+            sliding_window=4,
+            compress_ratios=[0, 2, 2, 2, 2],
+            kv_source_layer_ids=[1],
+            index_source_layer_ids=[1, 2],
+            candidate_source_layer_id=1,
+        )
+        model = deepseek_v41_language.LanguageModel(config)
+        _prepare_deepseek_v41_distributed(model, mx.float32)
+        for layer in model.layers:
+            layer.attn.ragged_decode = True
+        ids = mx.array([[3, 7, 5, 11, 19, 23, 5, 31, 2, 9, 6, 4, 8, 17, 21]])
+        prefixes = [1, 4, 7]
+        for width, retained in [(1, [1, 1, 1]), (6, [0, 3, 6])]:
+            rows, refs, blocks, expected = [], [], [], []
+            for i, prefix in enumerate(prefixes):
+                row = model.make_cache()[0]
+                mx.eval(model(ids[:, :prefix], cache=[row]).logits)
+                state, metadata = row._snapshot()
+                ref = type(row).from_state(state, metadata)
+                full = type(row).from_state([mx.array(v) for v in state], metadata)
+                block = ids[:, prefix : prefix + width]
+                expected.append(model(block, cache=[full]).logits)
+                if retained[i]:
+                    mx.eval(model(block[:, : retained[i]], cache=[ref]).logits)
+                rows.append(row)
+                refs.append(ref)
+                blocks.append(block)
+            cache = rows[0].merge(rows)
+            gen = cache.start_speculation(width, block=True) if width > 1 else None
+            with patch.object(
+                model.layers[0].attn,
+                "_ragged_attention",
+                wraps=model.layers[0].attn._ragged_attention,
+            ) as batched:
+                got = model(mx.concatenate(blocks), cache=[cache]).logits
+                self.assertTrue(
+                    mx.allclose(
+                        got, mx.concatenate(expected), atol=1e-4, rtol=1e-4
+                    ).item()
+                )
+                batched.assert_called_once()
+            if gen is not None:
+                cache.commit_speculation(retained, gen)
+            for row, ref in zip(cache.rows, refs):
+                self.assertEqual(row.offset, ref.offset)
+                self.assertTrue(
+                    mx.allclose(
+                        model(ids[:, -1:], cache=[row]).logits,
+                        model(ids[:, -1:], cache=[ref]).logits,
+                        atol=1e-4,
+                        rtol=1e-4,
+                    ).item()
+                )
 
     def test_batch_block_abort_restores_rows_and_validates_all_commits(self):
         model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))
@@ -8425,3 +8563,54 @@ def test_deepseek_v41_invalid_shard_preserves_parameters():
         model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
     after = dict(tree_flatten(model.parameters()))
     assert all(after[k] is v for k, v in before.items())
+
+
+def test_deepseek_v41_can_return_rank_local_vocabulary_after_prefill():
+    config = tiny_config("deepseek_v41")
+    model = deepseek_v41_language.LanguageModel(config)
+    _prepare_deepseek_v41_distributed(model, mx.float32)
+    ids = mx.array([[1, 2, 3]])
+    full = model(ids).logits
+    mid = config.vocab_size // 2
+    model.head.weight = model.head.weight[mid:]
+    model.head.sharding_group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    with patch.object(mx.distributed, "all_gather", side_effect=AssertionError):
+        cache = model.make_cache()
+        empty = model(ids[:, :2], cache=cache, logits_to_keep=0, local_vocab=True)
+        assert empty.logits.shape == (1, 0, config.vocab_size - mid)
+        last = model(ids[:, 2:], cache=cache, logits_to_keep=1, local_vocab=True)
+    np.testing.assert_allclose(last.logits, full[:, -1:, mid:], rtol=1e-4, atol=1e-4)
+
+
+def test_deepseek_v41_speculative_forward_keeps_local_vocabulary_after_commit():
+    model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))
+    _prepare_deepseek_v41_distributed(model, mx.float32)
+    tokens = mx.array([[3, 7, 5, 11, 19]])
+    reference = model(tokens, capture_layer_ids=[0])
+    mid = model.config.vocab_size // 2
+    model.head.weight = model.head.weight[:mid]
+    model.head.sharding_group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+    cache = model.make_cache()
+    with patch.object(mx.distributed, "all_gather", side_effect=AssertionError):
+        model(tokens[:, :2], cache=cache, logits_to_keep=0, local_vocab=True)
+        block = model(
+            tokens[:, 2:],
+            cache=cache,
+            capture_layer_ids=[0],
+            local_vocab=True,
+            speculative_verify=True,
+        )
+        np.testing.assert_allclose(
+            block.logits, reference.logits[:, 2:, :mid], atol=1e-4, rtol=1e-4
+        )
+        np.testing.assert_allclose(
+            block.hidden_states[0],
+            reference.hidden_states[0][:, 2:],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        block.gdn_states.commit([1])
+        next_step = model(tokens[:, 3:4], cache=cache, local_vocab=True)
+        np.testing.assert_allclose(
+            next_step.logits, reference.logits[:, 3:4, :mid], atol=1e-4, rtol=1e-4
+        )

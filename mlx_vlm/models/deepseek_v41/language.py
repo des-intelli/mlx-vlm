@@ -625,6 +625,10 @@ class DeepseekV41Attention(nn.Module):
 
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
+        self.ragged_decode = os.environ.get("MLX_VLM_V41_RAGGED_ATTENTION", "0") == "1"
+        self.group_decode_pools = (
+            os.environ.get("MLX_VLM_V41_GROUPED_DECODE_POOLS", "0") == "1"
+        )
         self.config = config
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
@@ -719,13 +723,15 @@ class DeepseekV41Attention(nn.Module):
         return part, valid[None, None]
 
     def _compress_part(self, x: mx.array, qr: mx.array, start_pos: int, cache):
-        """Shared compressed KV slice plus this layer's Top-K indices."""
-        batch, seqlen = x.shape[0], x.shape[1]
+        latent = self.compressor(x, start_pos, cache) if self.is_kv_source else None
+        return self._publish_compressed(x, qr, start_pos, cache, latent)
+
+    def _publish_compressed(self, x, qr, start_pos, cache, latent):
+        """Publish this row's completed groups and preserve its index handoffs."""
+        batch, seqlen = x.shape[:2]
         ratio = self.compress_ratio
-        latent = None
         if self.is_kv_source:
             cache.record_block_ratio(self.layer_idx, ratio)
-            latent = self.compressor(x, start_pos, cache)
             if latent is not None:
                 n_latent = latent.shape[1]
                 positions = (start_pos // ratio + mx.arange(n_latent)) * ratio
@@ -762,6 +768,12 @@ class DeepseekV41Attention(nn.Module):
         return pool, idxs
 
     def __call__(self, x: mx.array, cache):
+        if (
+            self.ragged_decode
+            and isinstance(cache, BatchDeepseekV41Cache)
+            and cache.can_batch_attention(x.shape[1])
+        ):
+            return self._ragged_attention(x, cache.rows)
         out = cache.map(self._attention, x)
         return mx.zeros_like(x) if out is None else out
 
@@ -791,16 +803,107 @@ class DeepseekV41Attention(nn.Module):
             self.attn_sink.astype(mx.float32),
         ).astype(q.dtype)
 
-    def _attention(self, cache: "DeepseekV41Cache", x: mx.array):
-        """Sparse attention over compressed positions and the sliding window."""
-        start_pos = cache.offset
-        batch, seqlen = x.shape[0], x.shape[1]
+    def _ragged_attention(self, x, rows):
+        """One projection, window update and attention batch at independent offsets."""
+        batch, width = x.shape[:2]
+        offsets = mx.array([row.offset for row in rows], dtype=mx.int32)
+        qr, q = self._query(x, offsets)
+        kv = self.kv_norm(self.wkv(fake_quant_fp8_ue8m0(x)))
+        kv = fake_quant_fp8_ue8m0(self.rope(kv[:, None], offsets)[:, 0])
+        layer, win = self.layer_idx, self.window_size
+        ring = mx.concatenate([row.window[layer] for row in rows])
+        batch_ids = mx.arange(batch)[:, None]
+        # Right-align each history before the common query block. Negative
+        # positions gather harmless ring slots and are masked in attention.
+        history = min(max(row.offset for row in rows), win - 1)
+        relative = mx.arange(-history, width)
+        positions = offsets[:, None] + relative
+        previous = ring[batch_ids, positions[:, :history] % win]
+        window = mx.concatenate([previous, kv], axis=1)
+        query = mx.arange(width)[:, None]
+        mask = ((relative <= query) & (relative > query - win))[None, None]
+        mask = mask & (positions >= 0)[:, None, None, :]
+        keep = min(win, width)
+        ring[batch_ids, positions[:, -keep:] % win] = kv[:, -keep:]
+        for index, row in enumerate(rows):
+            row.record_block_window(layer, kv[index : index + 1])
+            row.window[layer] = ring[index : index + 1]
+
+        out = None
+        if self.compress_ratio:
+            # Compression groups can close at different tokens. Keep each row's
+            # published pool, index handoff and rollback journal independent.
+            latents = (
+                self.compressor.append_batch(x, rows, offsets)
+                if self.is_kv_source
+                else [None] * batch
+            )
+            parts = [
+                self._publish_compressed(
+                    x[i : i + 1], qr[i : i + 1], row.offset, row, latents[i]
+                )
+                for i, row in enumerate(rows)
+            ]
+            pool_width = max(pool.shape[1] for pool, _ in parts)
+            if pool_width:
+                index_width = max(idx.shape[-1] for _, idx in parts)
+                indices = mx.concatenate(
+                    [
+                        mx.pad(
+                            idx,
+                            [(0, 0), (0, 0), (0, index_width - idx.shape[-1])],
+                            constant_values=-1,
+                        )
+                        for _, idx in parts
+                    ]
+                )
+                pools = tuple(value for value, _ in parts)
+                out = sparse_attention(
+                    q,
+                    window,
+                    pools,
+                    indices,
+                    mask,
+                    self.attn_sink,
+                    self.scale,
+                    self.window_size,
+                    group_decode_pools=self.group_decode_pools,
+                )
+                if out is None:
+                    pool = mx.concatenate(
+                        [
+                            mx.pad(
+                                value,
+                                [(0, 0), (0, pool_width - value.shape[1]), (0, 0)],
+                            )
+                            for value in pools
+                        ]
+                    )
+                    out = self._sparse_attention(q, window, pool, indices, mask)
+        if out is None:
+            kv = window[:, None].astype(q.dtype)
+            out = mx.fast.scaled_dot_product_attention(
+                q,
+                kv,
+                kv,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attn_sink.astype(q.dtype),
+            )
+        return self._project_output(out, offsets)
+
+    def _query(self, x, start_pos):
+        batch, seqlen = x.shape[:2]
         qr = self.q_norm(self.wq_a(fake_quant_fp8_ue8m0(x)))
         q = self.wq_b(fake_quant_fp8_ue8m0(qr)).reshape(
             batch, seqlen, self.n_heads, self.head_dim
         )
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, start_pos)
+        return qr, self.rope(q.transpose(0, 2, 1, 3), start_pos)
+
+    def _attention(self, cache: "DeepseekV41Cache", x: mx.array):
+        """Sparse attention over compressed positions and the sliding window."""
+        start_pos = cache.offset
+        qr, q = self._query(x, start_pos)
 
         window_kv, window_mask = self._window_part(x, start_pos, cache)
         out = None
@@ -824,6 +927,10 @@ class DeepseekV41Attention(nn.Module):
                 mask=window_mask,
                 sinks=self.attn_sink.astype(q.dtype),
             )
+        return self._project_output(out, start_pos)
+
+    def _project_output(self, out, start_pos):
+        batch, _, seqlen, _ = out.shape
         out = self.rope(out, start_pos, inverse=True)
 
         out = out.reshape(batch, self.o_groups, -1, seqlen, self.head_dim)
@@ -853,6 +960,44 @@ class Compressor(nn.Module):
         if compress_ratio > 1:
             self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self.layer_idx = layer_idx
+
+    def append_batch(self, x, rows, offsets):
+        """Advance independent compression rings in one indexed write per token."""
+        batch, width = x.shape[:2]
+        ratio, layer = self.compress_ratio, self.layer_idx
+        if ratio == 1:
+            latents = self.norm(self.wkv(x))
+            return [latents[i : i + 1] for i in range(batch)]
+        xf = x.astype(mx.float32)
+        kv, score = self.wkv(xf), self.wgate(xf)
+        for row in rows:
+            self._grow_state(1, row)
+        values = mx.concatenate([row.kv_state[layer] for row in rows])
+        scores = mx.concatenate([row.score_state[layer] for row in rows])
+        ids = mx.arange(batch)
+        completed = [[] for row in rows]
+        for token in range(width):
+            slots = (offsets + token) % ratio
+            values[ids, slots] = kv[:, token]
+            scores[ids, slots] = score[:, token]
+            finishing = [
+                i for i, row in enumerate(rows) if (row.offset + token + 1) % ratio == 0
+            ]
+            if finishing:
+                idx = mx.array(finishing)
+                pooled = self.norm(
+                    (values[idx] * mx.softmax(scores[idx], axis=1))
+                    .sum(axis=1)
+                    .astype(x.dtype)
+                )
+                for j, i in enumerate(finishing):
+                    completed[i].append(pooled[j : j + 1, None])
+            for i, row in enumerate(rows):
+                if row.is_block_speculating or token + 1 == width:
+                    row.kv_state[layer] = values[i : i + 1]
+                    row.score_state[layer] = scores[i : i + 1]
+                    row.record_block_compressor(layer)
+        return [mx.concatenate(parts, axis=1) if parts else None for parts in completed]
 
     def _grow_state(self, batch: int, cache):
         i = self.layer_idx
@@ -1086,9 +1231,9 @@ class ParallelHead(nn.Module):
         )
         self.sharding_group = None
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, *, local_vocab: bool = False) -> mx.array:
         logits = x.astype(mx.float32) @ self.weight.T
-        if self.sharding_group is not None:
+        if self.sharding_group is not None and not local_vocab:
             logits = mx.distributed.all_gather(
                 mx.moveaxis(logits, -1, 0), group=self.sharding_group
             )
@@ -1481,6 +1626,15 @@ class BatchDeepseekV41Cache:
         self._batch_size = len(rows)
         self._batched = None
 
+    def can_batch_attention(self, width):
+        return (
+            self._batch_size > 1
+            and (width == 1 or self.is_block_speculating)
+            and not any(self.left_padding)
+            and all(length is None for length in self._lengths)
+            and all(row.offset > 0 for row in self.rows)
+        )
+
     def for_decode(self, width):
         """Pack compatible one-token requests once; retain the packed state."""
         if (
@@ -1812,6 +1966,7 @@ class LanguageModel(nn.Module):
         inputs: Optional[mx.array] = None,
         n_to_process: Optional[int] = None,
         logits_to_keep: Optional[int] = None,
+        local_vocab: bool = False,
         **kwargs,
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
@@ -1821,6 +1976,8 @@ class LanguageModel(nn.Module):
         here rather than ignored; without them the tables contribute nothing
         and a chunked prompt encodes differently from an unchunked one.
         `n_to_process` is implied by the slice and is not needed.
+        With `local_vocab`, return the contiguous vocabulary shard owned by
+        this rank. The caller takes responsibility for distributed sampling.
         """
         if logits_to_keep is not None and logits_to_keep < 0:
             raise ValueError("logits_to_keep must be nonnegative or None")
@@ -1830,7 +1987,9 @@ class LanguageModel(nn.Module):
         if kwargs.pop("speculative_verify", False):
             from ...speculative.common import verify_forward
 
-            output, transaction = verify_forward(self, input_ids, cache, **kwargs)
+            output, transaction = verify_forward(
+                self, input_ids, cache, local_vocab=local_vocab, **kwargs
+            )
             output.gdn_states = transaction
             return output
 
@@ -1856,6 +2015,7 @@ class LanguageModel(nn.Module):
                     cache=cache,
                     image_mask=at(image_mask, i),
                     engram_hashes=at(engram_hashes, i),
+                    local_vocab=local_vocab,
                     **kwargs,
                 )
                 for i in range(length)
@@ -1914,11 +2074,13 @@ class LanguageModel(nn.Module):
             # A prefill-only step still executes the final layer's collectives
             # and materializes all recurrent state before the next chunk.
             mx.eval(h, entry.state)
-            logits = mx.zeros((batch, 0, self.config.vocab_size), mx.float32)
+            vocab = self.head.weight.shape[0] if local_vocab else self.config.vocab_size
+            logits = mx.zeros((batch, 0, vocab), mx.float32)
         else:
             if logits_to_keep is not None:
                 h = h[:, -logits_to_keep:]
                 pre_mix = pre_mix[:, -logits_to_keep:]
             h = DeepseekV41Block.hc_pre(h, pre_mix)
-            logits = self.head(self.norm(h))
+            h = self.norm(h)
+            logits = self.head(h, local_vocab=True) if local_vocab else self.head(h)
         return LanguageModelOutput(logits=logits, hidden_states=hidden)
