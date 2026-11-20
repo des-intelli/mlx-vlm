@@ -8449,3 +8449,54 @@ def test_deepseek_v41_invalid_shard_preserves_parameters():
         model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
     after = dict(tree_flatten(model.parameters()))
     assert all(after[k] is v for k, v in before.items())
+
+
+def test_deepseek_v41_can_return_rank_local_vocabulary_after_prefill():
+    config = tiny_config("deepseek_v41")
+    model = deepseek_v41_language.LanguageModel(config)
+    _prepare_deepseek_v41_distributed(model, mx.float32)
+    ids = mx.array([[1, 2, 3]])
+    full = model(ids).logits
+    mid = config.vocab_size // 2
+    model.head.weight = model.head.weight[mid:]
+    model.head.sharding_group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    with patch.object(mx.distributed, "all_gather", side_effect=AssertionError):
+        cache = model.make_cache()
+        empty = model(ids[:, :2], cache=cache, logits_to_keep=0, local_vocab=True)
+        assert empty.logits.shape == (1, 0, config.vocab_size - mid)
+        last = model(ids[:, 2:], cache=cache, logits_to_keep=1, local_vocab=True)
+    np.testing.assert_allclose(last.logits, full[:, -1:, mid:], rtol=1e-4, atol=1e-4)
+
+
+def test_deepseek_v41_speculative_forward_keeps_local_vocabulary_after_commit():
+    model = deepseek_v41_language.LanguageModel(tiny_config("deepseek_v41"))
+    _prepare_deepseek_v41_distributed(model, mx.float32)
+    tokens = mx.array([[3, 7, 5, 11, 19]])
+    reference = model(tokens, capture_layer_ids=[0])
+    mid = model.config.vocab_size // 2
+    model.head.weight = model.head.weight[:mid]
+    model.head.sharding_group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+    cache = model.make_cache()
+    with patch.object(mx.distributed, "all_gather", side_effect=AssertionError):
+        model(tokens[:, :2], cache=cache, logits_to_keep=0, local_vocab=True)
+        block = model(
+            tokens[:, 2:],
+            cache=cache,
+            capture_layer_ids=[0],
+            local_vocab=True,
+            speculative_verify=True,
+        )
+        np.testing.assert_allclose(
+            block.logits, reference.logits[:, 2:, :mid], atol=1e-4, rtol=1e-4
+        )
+        np.testing.assert_allclose(
+            block.hidden_states[0],
+            reference.hidden_states[0][:, 2:],
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        block.gdn_states.commit([1])
+        next_step = model(tokens[:, 3:4], cache=cache, local_vocab=True)
+        np.testing.assert_allclose(
+            next_step.logits, reference.logits[:, 3:4, :mid], atol=1e-4, rtol=1e-4
+        )

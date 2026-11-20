@@ -1211,9 +1211,9 @@ class ParallelHead(nn.Module):
         )
         self.sharding_group = None
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, *, local_vocab: bool = False) -> mx.array:
         logits = x.astype(mx.float32) @ self.weight.T
-        if self.sharding_group is not None:
+        if self.sharding_group is not None and not local_vocab:
             logits = mx.distributed.all_gather(
                 mx.moveaxis(logits, -1, 0), group=self.sharding_group
             )
@@ -1946,6 +1946,7 @@ class LanguageModel(nn.Module):
         inputs: Optional[mx.array] = None,
         n_to_process: Optional[int] = None,
         logits_to_keep: Optional[int] = None,
+        local_vocab: bool = False,
         **kwargs,
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
@@ -1955,6 +1956,8 @@ class LanguageModel(nn.Module):
         here rather than ignored; without them the tables contribute nothing
         and a chunked prompt encodes differently from an unchunked one.
         `n_to_process` is implied by the slice and is not needed.
+        With `local_vocab`, return the contiguous vocabulary shard owned by
+        this rank. The caller takes responsibility for distributed sampling.
         """
         if logits_to_keep is not None and logits_to_keep < 0:
             raise ValueError("logits_to_keep must be nonnegative or None")
@@ -1964,7 +1967,9 @@ class LanguageModel(nn.Module):
         if kwargs.pop("speculative_verify", False):
             from ...speculative.common import verify_forward
 
-            output, transaction = verify_forward(self, input_ids, cache, **kwargs)
+            output, transaction = verify_forward(
+                self, input_ids, cache, local_vocab=local_vocab, **kwargs
+            )
             output.gdn_states = transaction
             return output
 
@@ -1990,6 +1995,7 @@ class LanguageModel(nn.Module):
                     cache=cache,
                     image_mask=at(image_mask, i),
                     engram_hashes=at(engram_hashes, i),
+                    local_vocab=local_vocab,
                     **kwargs,
                 )
                 for i in range(length)
@@ -2048,11 +2054,13 @@ class LanguageModel(nn.Module):
             # A prefill-only step still executes the final layer's collectives
             # and materializes all recurrent state before the next chunk.
             mx.eval(h, entry.state)
-            logits = mx.zeros((batch, 0, self.config.vocab_size), mx.float32)
+            vocab = self.head.weight.shape[0] if local_vocab else self.config.vocab_size
+            logits = mx.zeros((batch, 0, vocab), mx.float32)
         else:
             if logits_to_keep is not None:
                 h = h[:, -logits_to_keep:]
                 pre_mix = pre_mix[:, -logits_to_keep:]
             h = DeepseekV41Block.hc_pre(h, pre_mix)
-            logits = self.head(self.norm(h))
+            h = self.norm(h)
+            logits = self.head(h, local_vocab=True) if local_vocab else self.head(h)
         return LanguageModelOutput(logits=logits, hidden_states=hidden)
