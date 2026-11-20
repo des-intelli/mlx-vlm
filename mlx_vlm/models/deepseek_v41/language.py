@@ -606,6 +606,9 @@ class DeepseekV41Attention(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
         self.ragged_decode = os.environ.get("MLX_VLM_V41_RAGGED_ATTENTION", "0") == "1"
+        self.group_decode_pools = (
+            os.environ.get("MLX_VLM_V41_GROUPED_DECODE_POOLS", "0") == "1"
+        )
         self.config = config
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
@@ -844,6 +847,7 @@ class DeepseekV41Attention(nn.Module):
                     self.attn_sink,
                     self.scale,
                     self.window_size,
+                    group_decode_pools=self.group_decode_pools,
                 )
                 if out is None:
                     pool = mx.concatenate(
